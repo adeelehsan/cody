@@ -191,7 +191,7 @@ func (m Model) SetSize(width, height int) Model {
 			oldRows = oldRows[:lastMeaningful+1]
 		}
 		if width != m.width {
-			newRows, newCursorRow, newCursorCol = reflowRows(oldRows, m.width, width, cy, cx)
+			newRows, newCursorRow, newCursorCol, _ = reflowRows(oldRows, m.width, width, cy, cx, nil)
 		} else {
 			// Width didn't change — nothing to rewrap. The old rows and
 			// cursor position pass through unchanged; writeReflowedRows

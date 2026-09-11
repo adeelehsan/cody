@@ -272,7 +272,7 @@ func TestReflowRowsNarrowsAndMapsCursorEndToEnd(t *testing.T) {
 	// One logical line, "1234567890abcde" (15 columns), wrapped across
 	// two physical rows at old width 10.
 	rows := []string{"1234567890", "abcde"}
-	newRows, newRow, newCol := reflowRows(rows, 10, 6, 1, 1) // cursor at row1, col1 = the 'b'
+	newRows, newRow, newCol, _ := reflowRows(rows, 10, 6, 1, 1, nil) // cursor at row1, col1 = the 'b'
 	wantRows := []string{"123456", "7890ab", "cde"}
 	if len(newRows) != len(wantRows) {
 		t.Fatalf("got %d rows %q, want %d rows %q", len(newRows), newRows, len(wantRows), wantRows)
@@ -294,7 +294,7 @@ func TestReflowRowsNarrowsAndMapsCursorEndToEnd(t *testing.T) {
 
 func TestReflowRowsWidensAndRejoins(t *testing.T) {
 	rows := []string{"ABCDEF", "GHIJKL"}                     // one logical line at old width 6
-	newRows, newRow, newCol := reflowRows(rows, 6, 40, 1, 5) // cursor at row1 col5 = 'L'
+	newRows, newRow, newCol, _ := reflowRows(rows, 6, 40, 1, 5, nil) // cursor at row1 col5 = 'L'
 	if len(newRows) != 1 || newRows[0] != "ABCDEFGHIJKL" {
 		t.Fatalf("got %q, want a single rejoined row", newRows)
 	}
@@ -305,7 +305,7 @@ func TestReflowRowsWidensAndRejoins(t *testing.T) {
 
 func TestReflowRowsKeepsUnrelatedLogicalLinesSeparate(t *testing.T) {
 	rows := []string{"short one", "short two", "short three"} // none filled to edge at width 20
-	newRows, _, _ := reflowRows(rows, 20, 5, 0, 0)
+	newRows, _, _, _ := reflowRows(rows, 20, 5, 0, 0, nil)
 	// Each stays its own logical line, independently rewrapped — no
 	// cross-line joining.
 	if len(newRows) < 3 {
@@ -391,5 +391,69 @@ func TestGroupIntoLogicalLinesKnownNilReproducesExistingHeuristic(t *testing.T) 
 				t.Fatalf("rows=%q: got counts=%v, want %v", rows, gotCounts, wantCounts)
 			}
 		}
+	}
+}
+
+// TestReflowRowsReturnsContinuationBitsForItsOwnOutput proves reflowRows
+// reports, for the rows it just produced, which ones are continuations
+// of the row above — the FIRST physical row of every rewrapped logical
+// line is false, every row after it within that same line is true.
+// This is the record Model.SetSize persists so the NEXT resize doesn't
+// have to re-guess this same content from its rendered strings.
+func TestReflowRowsReturnsContinuationBitsForItsOwnOutput(t *testing.T) {
+	// One logical line, "1234567890abcde" (15 columns), rewrapped at
+	// width 6 into 3 physical rows: "123456"/"7890ab"/"cde" -> [false, true, true].
+	rows := []string{"1234567890", "abcde"}
+	newRows, _, _, newContinues := reflowRows(rows, 10, 6, 0, 0, nil)
+	if len(newRows) != 3 {
+		t.Fatalf("got %d rows %q, want 3", len(newRows), newRows)
+	}
+	wantContinues := []bool{false, true, true}
+	if len(newContinues) != len(wantContinues) {
+		t.Fatalf("got newContinues=%v, want %v", newContinues, wantContinues)
+	}
+	for i := range wantContinues {
+		if newContinues[i] != wantContinues[i] {
+			t.Fatalf("got newContinues=%v, want %v", newContinues, wantContinues)
+		}
+	}
+}
+
+// TestReflowRowsReturnsContinuationBitsAcrossTwoLogicalLines proves the
+// false/true pattern restarts at false for each NEW logical line, not
+// just once for the whole batch.
+func TestReflowRowsReturnsContinuationBitsAcrossTwoLogicalLines(t *testing.T) {
+	// Two unrelated logical lines (neither filled to edge at width 20),
+	// each independently rewrapped at width 5: "short one" (9 cols) ->
+	// "short"/" one" (2 rows), "short two" (9 cols) -> "short"/" two" (2 rows).
+	rows := []string{"short one", "short two"}
+	newRows, _, _, newContinues := reflowRows(rows, 20, 5, 0, 0, nil)
+	if len(newRows) != 4 {
+		t.Fatalf("got %d rows %q, want 4", len(newRows), newRows)
+	}
+	wantContinues := []bool{false, true, false, true}
+	if len(newContinues) != len(wantContinues) {
+		t.Fatalf("got newContinues=%v, want %v", newContinues, wantContinues)
+	}
+	for i := range wantContinues {
+		if newContinues[i] != wantContinues[i] {
+			t.Fatalf("got newContinues=%v, want %v", newContinues, wantContinues)
+		}
+	}
+}
+
+// TestReflowRowsConsumesAKnownOverride proves reflowRows actually
+// passes `known` through to its internal grouping step, not just
+// accepting and ignoring the parameter.
+func TestReflowRowsConsumesAKnownOverride(t *testing.T) {
+	// Without an override, "short"/"next" are NOT joined (neither
+	// fills width 10) -> 2 independent logical lines, each passed
+	// through unchanged at newWidth 10 -> 2 output rows.
+	// WITH known=[false,true], they ARE forced into one 9-character
+	// logical line "shortnext", which still fits in one row at newWidth 10.
+	rows := []string{"short", "next"}
+	newRows, _, _, _ := reflowRows(rows, 10, 10, 0, 0, []bool{false, true})
+	if len(newRows) != 1 || newRows[0] != "shortnext" {
+		t.Fatalf("got newRows=%q, want a single joined row %q — known override was not consumed", newRows, []string{"shortnext"})
 	}
 }

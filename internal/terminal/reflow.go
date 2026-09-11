@@ -192,12 +192,25 @@ func cursorAfterRewrap(newRows []string, offset int) (row, col int) {
 // coordinates — into the new layout. This is the single entry point
 // Model.SetSize calls; it is stateless (nothing here reads or writes
 // any field that persists across calls) — every call re-derives
-// entirely from the rows it's given, which is what makes this robust
-// against a shell redrawing or scrolling mid-resize (see the design
-// spec's §3.4): there is no earlier-moment snapshot for such a redraw
-// to invalidate.
-func reflowRows(rows []string, oldWidth, newWidth, cursorRow, cursorCol int) (newRows []string, newCursorRow, newCursorCol int) {
-	lines, counts := groupIntoLogicalLines(rows, oldWidth)
+// entirely from the rows and known continuation bits it's given, which
+// is what makes this robust against a shell redrawing or scrolling
+// mid-resize (see the design spec's §3.4): there is no earlier-moment
+// snapshot for such a redraw to invalidate.
+//
+// known carries prior-known continuation bits for rows (see
+// groupIntoLogicalLinesKnown) — pass nil when there is no trustworthy
+// record (fresh content, or after real output invalidated it).
+// newContinues is the continuation bits for newRows — the FIRST
+// physical row of every rewrapped logical line is false, every row
+// after it within that same line is true. The caller (Model.SetSize)
+// persists this as the new authoritative record for whatever ends up
+// live after height-eviction, so the NEXT resize doesn't have to
+// re-guess this same content from its rendered strings (see the
+// design spec's "self-tracked continuation bits" section — this is
+// the mechanism that stops a single dropped word-boundary space from
+// compounding across a long resize sequence).
+func reflowRows(rows []string, oldWidth, newWidth, cursorRow, cursorCol int, known []bool) (newRows []string, newCursorRow, newCursorCol int, newContinues []bool) {
+	lines, counts := groupIntoLogicalLinesKnown(rows, oldWidth, known)
 	cursorLine, offset := cursorOffset(rows, counts, cursorRow, cursorCol)
 	for li, line := range lines {
 		rewrapped := rewrapLogicalLine(line, newWidth)
@@ -207,6 +220,9 @@ func reflowRows(rows []string, oldWidth, newWidth, cursorRow, cursorCol int) (ne
 			newCursorCol = c
 		}
 		newRows = append(newRows, rewrapped...)
+		for k := range rewrapped {
+			newContinues = append(newContinues, k > 0)
+		}
 	}
-	return newRows, newCursorRow, newCursorCol
+	return newRows, newCursorRow, newCursorCol, newContinues
 }
