@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/xpty"
 
 	"cody/internal/scrollbar"
@@ -80,6 +81,18 @@ type Model struct {
 	// no "continuing the same gesture" concept that would ever call for
 	// a prepend.
 	shrinkOverflow []string
+	// rowContinues holds, for each of the current live rows (same
+	// indexing as the grid itself, length == m.height when
+	// trustworthy), whether that row is a soft-wrap continuation of
+	// the row above it — as determined with certainty by this
+	// package's own last reflow, not guessed from rendered text. nil
+	// means "no trustworthy record for the current grid" (nothing has
+	// been reflowed yet, or real output arrived and invalidated it) —
+	// every consumer must treat nil exactly like "fall back to
+	// isRowFilledToEdge's heuristic," so this can never make behavior
+	// worse than before this field existed, only better. See the
+	// design spec at docs/superpowers/specs/2026-09-11-reflow-continuation-tracking-design.md.
+	rowContinues []bool
 }
 
 // New creates a terminal session identified by id — a value the caller
@@ -172,6 +185,7 @@ func (m Model) SetSize(width, height int) Model {
 	doResize := changed && m.emu != nil && m.width > 0 && m.height > 0 && !m.emu.IsAltScreen()
 	var newRows []string
 	var newCursorRow, newCursorCol int
+	var newContinues []bool
 	if doResize {
 		oldRows := strings.Split(m.emu.Render(), "\n")
 		cx, cy := m.emu.CursorPosition()
@@ -190,14 +204,35 @@ func (m Model) SetSize(width, height int) Model {
 		if lastMeaningful+1 < len(oldRows) {
 			oldRows = oldRows[:lastMeaningful+1]
 		}
+		// The real vt.Emulator strips trailing blank cells when it
+		// renders a row back to a string — indistinguishable, cell by
+		// cell, from a row that just never reached the edge (see
+		// reflow.go's design notes). Whenever m.rowContinues already
+		// knows FOR CERTAIN that row i continues row i-1, row i-1 MUST
+		// have been exactly m.width columns wide the moment this
+		// package wrote it — so any shortfall here is exactly that
+		// stripped whitespace, not missing content, and restoring it
+		// before reflow/pass-through is what keeps a wrap boundary that
+		// lands on a space from silently losing that space on every
+		// resize after the one that first produced it.
+		for i := 1; i < len(oldRows) && i < len(m.rowContinues); i++ {
+			if !m.rowContinues[i] {
+				continue
+			}
+			if pad := m.width - ansi.StringWidth(oldRows[i-1]); pad > 0 {
+				oldRows[i-1] += strings.Repeat(" ", pad)
+			}
+		}
 		if width != m.width {
-			newRows, newCursorRow, newCursorCol, _ = reflowRows(oldRows, m.width, width, cy, cx, nil)
+			newRows, newCursorRow, newCursorCol, newContinues = reflowRows(oldRows, m.width, width, cy, cx, m.rowContinues)
 		} else {
-			// Width didn't change — nothing to rewrap. The old rows and
-			// cursor position pass through unchanged; writeReflowedRows
-			// below still handles a height change on its own (evicting
-			// excess into shrinkOverflow if the new height is smaller).
+			// Width didn't change — nothing to rewrap. The old rows,
+			// cursor position, and known continuation bits all pass
+			// through unchanged; writeReflowedRows below still handles
+			// a height change on its own (evicting excess into
+			// shrinkOverflow if the new height is smaller).
 			newRows, newCursorRow, newCursorCol = oldRows, cy, cx
+			newContinues = m.rowContinues
 		}
 	}
 	m.width, m.height = width, height
@@ -210,7 +245,7 @@ func (m Model) SetSize(width, height int) Model {
 		}
 	}
 	if doResize {
-		m = m.writeReflowedRows(newRows, newCursorRow, newCursorCol, height)
+		m = m.writeReflowedRows(newRows, newCursorRow, newCursorCol, height, newContinues)
 	}
 	return m
 }
@@ -231,7 +266,17 @@ func (m Model) SetSize(width, height int) Model {
 // "continuing the same gesture" concept (see reflowRows' own doc
 // comment) — every call's overflow is, by construction, a fresh batch
 // relative to whatever shrinkOverflow already holds.
-func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, newHeight int) Model {
+//
+// newContinues carries the known-continuation bits for newRows (see
+// reflowRows' own doc comment) — shifted/trimmed here in lockstep with
+// newRows whenever excess rows get evicted into shrinkOverflow, then
+// stored as the new m.rowContinues (padded with false for any row from
+// len(newRows) through newHeight-1, since blank padding is never a
+// continuation of anything). This is what lets the NEXT SetSize call
+// trust this resize's own output instead of re-deriving it from
+// rendered strings — see the design spec at
+// docs/superpowers/specs/2026-09-11-reflow-continuation-tracking-design.md.
+func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, newHeight int, newContinues []bool) Model {
 	if excess := len(newRows) - newHeight; excess > 0 {
 		beforeOverflowLen := len(m.shrinkOverflow)
 		m.shrinkOverflow = append(m.shrinkOverflow, newRows[:excess]...)
@@ -250,6 +295,11 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 			m.scrollOffset += len(m.shrinkOverflow) - beforeOverflowLen
 		}
 		newRows = newRows[excess:]
+		if excess <= len(newContinues) {
+			newContinues = newContinues[excess:]
+		} else {
+			newContinues = nil
+		}
 		newCursorRow -= excess
 	}
 	if newCursorRow < 0 {
@@ -285,6 +335,10 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 	}
 	if newHeight > 0 {
 		fmt.Fprintf(&buf, "\x1b[%d;%dH", newCursorRow+1, newCursorCol+1)
+	}
+	m.rowContinues = append([]bool(nil), newContinues...)
+	for len(m.rowContinues) < newHeight {
+		m.rowContinues = append(m.rowContinues, false)
 	}
 	m.emu.Write([]byte(buf.String()))
 	return m
@@ -398,6 +452,16 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			beforeLen = m.emu.ScrollbackLen()
 		}
 		m.emu.Write(msg.data)
+		// Any real output can change rows this package previously
+		// tracked as reflow continuations in ways it has no visibility
+		// into (new content, a redraw, a prompt repaint) — the tracked
+		// record can only be trusted for a resize-only sequence with
+		// nothing typed in between, so it must not survive past this
+		// point. The next SetSize call falls back to the heuristic for
+		// this content (identical to today's behavior) and rebuilds a
+		// fresh, trustworthy record from there for any FURTHER resize
+		// in the same drag.
+		m.rowContinues = nil
 		switch {
 		case wasAltScreen && !m.emu.IsAltScreen():
 			// The alt screen (vim, less, ...) just exited as part of this

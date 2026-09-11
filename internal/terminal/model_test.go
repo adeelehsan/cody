@@ -1440,3 +1440,102 @@ func TestSetSizeSimulatedCornerDragPreservesContentBothWays(t *testing.T) {
 		t.Fatalf("got line not found intact anywhere after a simulated corner-drag round trip (live view=%q), want it reachable and un-truncated", m.View())
 	}
 }
+
+// TestSetSizeSequentialResizesDoNotDropAWordBoundarySpace is the
+// regression test for the bug reported after the width+height
+// unification fix shipped: a real corner-drag (many sequential SetSize
+// calls, both dimensions changing every step, nothing typed in
+// between) was still destroying content — a real space character
+// between two words got silently and permanently dropped, and by the
+// end of a longer drag, unrelated words were fused together with no
+// space at all.
+//
+// Root cause: groupIntoLogicalLines decides "did row i wrap into row
+// i+1" from the ROW'S RENDERED STRING (isRowFilledToEdge) — but the
+// real vt.Emulator strips a row's trailing blank cell when rendering
+// it back to a string, so a wrap boundary that lands exactly after a
+// space (extremely common in prose) makes the row measure one column
+// SHORT, and the heuristic wrongly concludes "not a continuation" —
+// permanently losing that space, not just miscounting it. Because
+// EVERY SetSize call re-derives this from scratch, that single mistake
+// can seed a DIFFERENT, unrelated misjudgment on a later resize step,
+// compounding across a long drag.
+//
+// This test deliberately engineers a wrap boundary landing exactly on
+// a space, confirms that boundary really does trip the known
+// rendered-string ambiguity (sanity-checking the repro itself, not
+// just hoping it does), then drives 24 sequential SetSize calls with
+// no output in between — mirroring the density of a real window-corner
+// drag, denser than the 5-6-jump verification that let this bug ship
+// undetected the first time — and asserts the space and every word
+// survive completely intact at the end.
+func TestSetSizeSequentialResizesDoNotDropAWordBoundarySpace(t *testing.T) {
+	p := &fakePty{}
+	origPty := newPty
+	newPty = func(width, height int) (Pty, error) { return p, nil }
+	t.Cleanup(func() { newPty = origPty })
+
+	m := New(1).SetSize(118, 35)
+	m, _ = m.Start()
+	t.Cleanup(func() { _ = m.Close() })
+
+	text := "  from rendered rows rather than raw terminal cells. Content that scrolls\r\n" +
+		"  off the pane's visible area (from a height shrink or from reflow\r\n" +
+		"  running out of room) is also never re-wrapped again by a later resize\r\n" +
+		"  it stays wrapped at whatever width it was at when it scrolled off,\r\n"
+	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(text)})
+	m = updated
+
+	// Sanity-check the repro's own premise before relying on it: at
+	// width 46, the first logical line's first physical row really
+	// does measure one column short of "filled to the edge" (46),
+	// because the wrap boundary lands right after a space. This has to
+	// be checked against the REAL vt.Emulator's own write+render round
+	// trip (not rewrapLogicalLine's pure in-memory output, which never
+	// strips anything) — it's specifically the real emulator's
+	// trailing-blank-cell stripping on render that produces the
+	// one-column-short measurement this whole bug depends on. If this
+	// ever stops being true (e.g. the emulator's rendering changes),
+	// this test would otherwise silently stop testing anything.
+	oneLine := "  from rendered rows rather than raw terminal cells. Content that scrolls"
+	sanityEmu := newEmulator(46, 10)
+	sanityEmu.Write([]byte(oneLine))
+	firstRowAt46 := strings.Split(sanityEmu.Render(), "\n")[0]
+	if isRowFilledToEdge(firstRowAt46, 46) {
+		t.Fatalf("repro premise broken: row %q unexpectedly measures filled-to-edge at width 46 — this test needs updating, it is no longer exercising the missed-join ambiguity", firstRowAt46)
+	}
+
+	widths := []struct{ w, h int }{
+		{110, 34}, {102, 33}, {94, 32}, {86, 31}, {78, 30},
+		{70, 29}, {62, 28}, {54, 27}, {46, 26}, {38, 25},
+		{30, 24}, {28, 23}, {30, 24}, {38, 25}, {46, 26},
+		{54, 27}, {62, 28}, {70, 29}, {78, 30}, {86, 31},
+		{94, 32}, {102, 33}, {110, 34}, {118, 35},
+	}
+	for _, wh := range widths {
+		m = m.SetSize(wh.w, wh.h)
+	}
+
+	view := m.View()
+	for _, want := range []string{
+		"rather than raw terminal cells",
+		"Content that scrolls",
+		"height shrink or from reflow",
+		"is also never re-wrapped again by a later resize",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("final view missing intact phrase %q (word boundary dropped or content fused) — full view:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "  ") {
+		// Two consecutive spaces anywhere outside the deliberate
+		// leading indent would be suspicious, but leading indents are
+		// legitimate — check instead for the SPECIFIC glued-word
+		// failure signatures this bug actually produced.
+		for _, glued := range []string{"terminalcells", "ratherthan", "scrollsoff"} {
+			if strings.Contains(view, glued) {
+				t.Fatalf("got glued-together words containing %q in view:\n%s", glued, view)
+			}
+		}
+	}
+}
