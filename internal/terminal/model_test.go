@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os/exec"
 	"strings"
@@ -1537,5 +1538,82 @@ func TestSetSizeSequentialResizesDoNotDropAWordBoundarySpace(t *testing.T) {
 				t.Fatalf("got glued-together words containing %q in view:\n%s", glued, view)
 			}
 		}
+	}
+}
+
+// TestSetSizeRowContinuesInvalidatedByRealOutputBetweenResizes proves
+// the safety valve: real output arriving between two resizes must not
+// panic or corrupt worse than the pre-existing single-miss heuristic
+// behavior — the tracked record simply resets to nil (identical to
+// having never reflowed this content before), and the next resize
+// falls back to today's heuristic for it, exactly as before this
+// feature existed.
+func TestSetSizeRowContinuesInvalidatedByRealOutputBetweenResizes(t *testing.T) {
+	p := &fakePty{}
+	origPty := newPty
+	newPty = func(width, height int) (Pty, error) { return p, nil }
+	t.Cleanup(func() { newPty = origPty })
+
+	m := New(1).SetSize(40, 10)
+	m, _ = m.Start()
+	t.Cleanup(func() { _ = m.Close() })
+
+	const line = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
+	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(line)})
+	m = updated
+
+	m = m.SetSize(10, 10) // builds a tracked rowContinues record
+	if m.rowContinues == nil {
+		t.Fatalf("got nil rowContinues after a width-changing resize, want a populated record")
+	}
+
+	updated, _ = m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte("more")})
+	m = updated
+	if m.rowContinues != nil {
+		t.Fatalf("got non-nil rowContinues after real output, want nil — output must invalidate the tracked record")
+	}
+
+	// Must not panic, and must still produce SOME reasonable output —
+	// no crash is the bar here, not perfection.
+	m = m.SetSize(40, 10)
+	if m.View() == "" {
+		t.Fatalf("got empty view after resize following an invalidated record, want non-empty content")
+	}
+}
+
+// TestSetSizeRowContinuesSurvivesHeightEvictionWithoutPanicking drives
+// a resize sequence dense enough to evict rows into shrinkOverflow
+// WHILE rowContinues is populated, asserting no index-out-of-range
+// panic and that the surviving live rows' content is still correct
+// after the eviction shifts both newRows and rowContinues together.
+func TestSetSizeRowContinuesSurvivesHeightEvictionWithoutPanicking(t *testing.T) {
+	p := &fakePty{}
+	origPty := newPty
+	newPty = func(width, height int) (Pty, error) { return p, nil }
+	t.Cleanup(func() { newPty = origPty })
+
+	m := New(1).SetSize(80, 20)
+	m, _ = m.Start()
+	t.Cleanup(func() { _ = m.Close() })
+
+	var lines strings.Builder
+	for i := 0; i < 15; i++ {
+		fmt.Fprintf(&lines, "line number %d of the test content\r\n", i)
+	}
+	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(lines.String())})
+	m = updated
+
+	// First resize builds a tracked record.
+	m = m.SetSize(40, 20)
+	// Second resize shrinks HEIGHT enough to force eviction into
+	// shrinkOverflow while rowContinues is populated from the first.
+	m = m.SetSize(30, 5)
+	// Third resize changes width again, consuming whatever tracked
+	// record survived the eviction above.
+	m = m.SetSize(60, 5)
+
+	view := m.View()
+	if !strings.Contains(view, "line number 14") {
+		t.Fatalf("got view missing the most recent content after eviction:\n%s", view)
 	}
 }
