@@ -93,6 +93,19 @@ type Model struct {
 	// worse than before this field existed, only better. See the
 	// design spec at docs/superpowers/specs/2026-09-11-reflow-continuation-tracking-design.md.
 	rowContinues []bool
+	// rowWrittenWidths holds, for each of the current live rows (same
+	// indexing/lifecycle as rowContinues), the exact display width this
+	// package wrote that row at — ground truth, not an assumption. A
+	// continuation row is not always exactly m.width wide: rewrapLogicalLine
+	// can leave a row one column short when a trailing wide (double-width)
+	// character cluster didn't fit and was carried whole to the next row
+	// (see its own doc comment, pinned by TestRewrapLogicalLineNeverSplitsAWideCluster).
+	// Recording the true written width (rather than assuming m.width) is
+	// what lets SetSize's padding restoration below tell "the emulator
+	// stripped a trailing space" apart from "this row was correctly one
+	// column short" — conflating the two corrupts wide-character content
+	// by inserting a space that was never there.
+	rowWrittenWidths []int
 }
 
 // New creates a terminal session identified by id — a value the caller
@@ -208,18 +221,29 @@ func (m Model) SetSize(width, height int) Model {
 		// renders a row back to a string — indistinguishable, cell by
 		// cell, from a row that just never reached the edge (see
 		// reflow.go's design notes). Whenever m.rowContinues already
-		// knows FOR CERTAIN that row i continues row i-1, row i-1 MUST
-		// have been exactly m.width columns wide the moment this
-		// package wrote it — so any shortfall here is exactly that
-		// stripped whitespace, not missing content, and restoring it
-		// before reflow/pass-through is what keeps a wrap boundary that
-		// lands on a space from silently losing that space on every
-		// resize after the one that first produced it.
+		// knows row i continues row i-1, row i-1 was written by this
+		// package's own last reflow at the width recorded in
+		// m.rowWrittenWidths[i-1] — NOT necessarily m.width itself: a
+		// continuation row can legitimately be one column short of
+		// m.width when a trailing wide (double-width) character
+		// cluster didn't fit and rewrapLogicalLine carried it whole to
+		// the next row instead of splitting it (see rewrapLogicalLine's
+		// own doc comment and TestRewrapLogicalLineNeverSplitsAWideCluster).
+		// Comparing against the RECORDED true width, rather than
+		// assuming m.width, is what tells "the emulator stripped a
+		// trailing space" (shortfall vs. the recorded width) apart from
+		// "this row was correctly one column short already" (no
+		// shortfall vs. the recorded width) — conflating the two would
+		// corrupt wide-character content by padding in a space that was
+		// never there.
 		for i := 1; i < len(oldRows) && i < len(m.rowContinues); i++ {
 			if !m.rowContinues[i] {
 				continue
 			}
-			if pad := m.width - ansi.StringWidth(oldRows[i-1]); pad > 0 {
+			if i-1 >= len(m.rowWrittenWidths) {
+				continue
+			}
+			if pad := m.rowWrittenWidths[i-1] - ansi.StringWidth(oldRows[i-1]); pad > 0 {
 				oldRows[i-1] += strings.Repeat(" ", pad)
 			}
 		}
@@ -276,6 +300,11 @@ func (m Model) SetSize(width, height int) Model {
 // trust this resize's own output instead of re-deriving it from
 // rendered strings — see the design spec at
 // docs/superpowers/specs/2026-09-11-reflow-continuation-tracking-design.md.
+// m.rowWrittenWidths is derived the same way, from newRows AFTER the
+// eviction shift below (so it naturally lines up with the same, already
+// -shifted rows, with no separate slice to shift in parallel) — see its
+// own field doc comment on Model for why the true written width, not
+// m.width, must be what SetSize compares against later.
 func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, newHeight int, newContinues []bool) Model {
 	if excess := len(newRows) - newHeight; excess > 0 {
 		beforeOverflowLen := len(m.shrinkOverflow)
@@ -339,6 +368,19 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 	m.rowContinues = append([]bool(nil), newContinues...)
 	for len(m.rowContinues) < newHeight {
 		m.rowContinues = append(m.rowContinues, false)
+	}
+	// rowWrittenWidths records the TRUE display width each row of
+	// newRows was actually written at — ground truth for SetSize's
+	// padding-restoration on the NEXT resize (see its own doc comment
+	// and rowWrittenWidths' own field comment on Model). Rows beyond
+	// len(newRows) are blank padding, never a continuation of anything,
+	// so width 0 there is never consulted.
+	m.rowWrittenWidths = make([]int, newHeight)
+	for i, row := range newRows {
+		if i >= newHeight {
+			break
+		}
+		m.rowWrittenWidths[i] = ansi.StringWidth(row)
 	}
 	m.emu.Write([]byte(buf.String()))
 	return m
@@ -462,6 +504,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		// fresh, trustworthy record from there for any FURTHER resize
 		// in the same drag.
 		m.rowContinues = nil
+		m.rowWrittenWidths = nil
 		switch {
 		case wasAltScreen && !m.emu.IsAltScreen():
 			// The alt screen (vim, less, ...) just exited as part of this

@@ -1617,3 +1617,60 @@ func TestSetSizeRowContinuesSurvivesHeightEvictionWithoutPanicking(t *testing.T)
 		t.Fatalf("got view missing the most recent content after eviction:\n%s", view)
 	}
 }
+
+// TestSetSizeSequentialResizesDoNotInsertSpuriousSpaceInWideCharacterContent
+// is the regression test for a Critical bug found in code review of this
+// package's padding-restoration fix (see SetSize's own comment): the fix
+// originally assumed every row m.rowContinues[i] marks as a continuation
+// must have been written at exactly m.width columns, padding any
+// shortfall back up to m.width on the theory that the real vt.Emulator
+// always strips it as trailing blank whitespace. That assumption is false
+// — rewrapLogicalLine can legitimately leave a continuation row ONE
+// column short of the target width when a trailing wide (double-width)
+// character cluster doesn't fit and gets carried whole to the next row
+// instead of being split (see rewrapLogicalLine's own doc comment,
+// already pinned by TestRewrapLogicalLineNeverSplitsAWideCluster). Padding
+// that row back to m.width with a space inserts a character that was
+// never actually there, corrupting otherwise-correct wide-character
+// content.
+//
+// This drives CJK content (each character two display columns wide)
+// through a sequential resize chain dense enough to repeatedly force a
+// width that can't evenly divide 2-column characters — guaranteeing at
+// least one wide-cluster-carried, one-column-short continuation row
+// somewhere in the sequence — then asserts the content survives with NO
+// spurious space inserted anywhere between the characters.
+func TestSetSizeSequentialResizesDoNotInsertSpuriousSpaceInWideCharacterContent(t *testing.T) {
+	p := &fakePty{}
+	origPty := newPty
+	newPty = func(width, height int) (Pty, error) { return p, nil }
+	t.Cleanup(func() { newPty = origPty })
+
+	m := New(1).SetSize(20, 10)
+	m, _ = m.Start()
+	t.Cleanup(func() { _ = m.Close() })
+
+	const text = "你好世界"
+	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(text)})
+	m = updated
+
+	widths := []int{18, 16, 14, 12, 10, 8, 6, 4, 3, 4, 6, 8, 10, 12, 14, 16, 18, 20}
+	for _, w := range widths {
+		m = m.SetSize(w, 10)
+	}
+
+	// Reconstruct the wrapped content as one continuous string, since a
+	// legitimate wrap at these narrow widths still puts characters on
+	// separate physical rows — that's fine; only a genuinely INSERTED
+	// space character is the bug.
+	joined := strings.ReplaceAll(m.View(), "\n", "")
+	joined = strings.TrimRight(joined, " ")
+	if !strings.Contains(joined, text) {
+		t.Fatalf("got content not intact as %q after resize sequence — full view:\n%s", text, m.View())
+	}
+	for _, spurious := range []string{"你 好", "好 世", "世 界", "你好 ", " 世界"} {
+		if strings.Contains(m.View(), spurious) {
+			t.Fatalf("got spurious space signature %q in view:\n%s", spurious, m.View())
+		}
+	}
+}
