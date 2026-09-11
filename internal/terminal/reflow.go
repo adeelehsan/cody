@@ -20,9 +20,31 @@ func isRowFilledToEdge(row string, width int) bool {
 // physicalRowCounts[j] holds how many physical rows contributed to
 // lines[j], in the same order — cursorOffset (see reflow.go) uses this
 // to map a physical row index back to a logical line index.
+//
+// This is a thin wrapper over groupIntoLogicalLinesKnown with no
+// override — every existing caller keeps this exact heuristic-only
+// behavior unchanged.
 func groupIntoLogicalLines(rows []string, width int) (lines []string, physicalRowCounts []int) {
+	return groupIntoLogicalLinesKnown(rows, width, nil)
+}
+
+// groupIntoLogicalLinesKnown is groupIntoLogicalLines with an optional
+// authoritative override: when known[i] is available (known != nil and
+// i < len(known)), it is trusted outright as "row i continues row i-1"
+// instead of being computed from isRowFilledToEdge(rows[i-1], width) —
+// this is how reflowRows avoids repeating a rendered-string guess for
+// rows it already reflowed once itself (see reflowRows' doc comment
+// and the design spec's "self-tracked continuation bits" section). A
+// known slice shorter than rows (or nil) falls back to the heuristic
+// for every row past its end — never a hard error, always a graceful
+// degrade to prior behavior.
+func groupIntoLogicalLinesKnown(rows []string, width int, known []bool) (lines []string, physicalRowCounts []int) {
 	for i, row := range rows {
-		if i == 0 || !isRowFilledToEdge(rows[i-1], width) {
+		continues := i > 0 && isRowFilledToEdge(rows[i-1], width)
+		if known != nil && i < len(known) {
+			continues = known[i]
+		}
+		if i == 0 || !continues {
 			lines = append(lines, row)
 			physicalRowCounts = append(physicalRowCounts, 1)
 			continue

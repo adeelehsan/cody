@@ -312,3 +312,84 @@ func TestReflowRowsKeepsUnrelatedLogicalLinesSeparate(t *testing.T) {
 		t.Fatalf("got %d rows %q, want each of the 3 unrelated lines to still be present as separate wrapped groups", len(newRows), newRows)
 	}
 }
+
+// TestGroupIntoLogicalLinesKnownOverrideForcesAJoin proves a `known`
+// override wins over a heuristic that would NOT join these rows on its
+// own (neither row is filled to the edge at width 10) — this is how
+// reflowRows avoids re-guessing content it already reflowed once.
+func TestGroupIntoLogicalLinesKnownOverrideForcesAJoin(t *testing.T) {
+	lines, counts := groupIntoLogicalLinesKnown([]string{"short", "next"}, 10, []bool{false, true})
+	wantLines := []string{"shortnext"}
+	if len(lines) != 1 || lines[0] != wantLines[0] {
+		t.Fatalf("got lines=%q, want %q — known[1]=true must force a join the heuristic alone would not make", lines, wantLines)
+	}
+	if len(counts) != 1 || counts[0] != 2 {
+		t.Fatalf("got counts=%v, want [2]", counts)
+	}
+}
+
+// TestGroupIntoLogicalLinesKnownOverrideForcesASplit proves the other
+// direction: a `known` override can force rows APART even when the
+// heuristic alone would join them (both rows filled to the edge at
+// width 10).
+func TestGroupIntoLogicalLinesKnownOverrideForcesASplit(t *testing.T) {
+	lines, counts := groupIntoLogicalLinesKnown([]string{"1234567890", "abcdefghij"}, 10, []bool{false, false})
+	wantLines := []string{"1234567890", "abcdefghij"}
+	if len(lines) != 2 || lines[0] != wantLines[0] || lines[1] != wantLines[1] {
+		t.Fatalf("got lines=%q, want %q — known[1]=false must force a split the heuristic alone would not make", lines, wantLines)
+	}
+	if len(counts) != 2 || counts[0] != 1 || counts[1] != 1 {
+		t.Fatalf("got counts=%v, want [1 1]", counts)
+	}
+}
+
+// TestGroupIntoLogicalLinesKnownShorterThanRowsFallsBackPastItsEnd
+// proves a `known` slice shorter than `rows` degrades gracefully: rows
+// within its range are still overridden, rows past its end fall back
+// to the heuristic.
+func TestGroupIntoLogicalLinesKnownShorterThanRowsFallsBackPastItsEnd(t *testing.T) {
+	// known only covers row 0 and row 1 (both false — no override
+	// effect there since heuristic already says false at index 0
+	// trivially and these are short rows anyway). Row 2 has no known
+	// entry, so it falls back to isRowFilledToEdge(rows[1], 10), which
+	// is false ("next" is not filled to width 10) -> row 2 stays
+	// separate.
+	lines, counts := groupIntoLogicalLinesKnown([]string{"short", "next", "third"}, 10, []bool{false, false})
+	wantLines := []string{"short", "next", "third"}
+	if len(lines) != 3 || lines[0] != wantLines[0] || lines[1] != wantLines[1] || lines[2] != wantLines[2] {
+		t.Fatalf("got lines=%q, want %q", lines, wantLines)
+	}
+	if len(counts) != 3 {
+		t.Fatalf("got counts=%v, want 3 entries of 1 each", counts)
+	}
+}
+
+// TestGroupIntoLogicalLinesKnownNilReproducesExistingHeuristic proves
+// nil known is IDENTICAL to calling groupIntoLogicalLines directly —
+// this is the regression guard that keeps all 8 existing
+// groupIntoLogicalLines callers correct with zero code changes.
+func TestGroupIntoLogicalLinesKnownNilReproducesExistingHeuristic(t *testing.T) {
+	cases := [][]string{
+		{"1234567890", "abcde"},
+		{"short", "next"},
+		{"1234567890", "1234567890", "end"},
+		{"abcde fgh", "ijk"},
+	}
+	for _, rows := range cases {
+		wantLines, wantCounts := groupIntoLogicalLines(rows, 10)
+		gotLines, gotCounts := groupIntoLogicalLinesKnown(rows, 10, nil)
+		if len(gotLines) != len(wantLines) {
+			t.Fatalf("rows=%q: got %d lines, want %d", rows, len(gotLines), len(wantLines))
+		}
+		for i := range wantLines {
+			if gotLines[i] != wantLines[i] {
+				t.Fatalf("rows=%q: got lines=%q, want %q (nil known must match groupIntoLogicalLines exactly)", rows, gotLines, wantLines)
+			}
+		}
+		for i := range wantCounts {
+			if gotCounts[i] != wantCounts[i] {
+				t.Fatalf("rows=%q: got counts=%v, want %v", rows, gotCounts, wantCounts)
+			}
+		}
+	}
+}
