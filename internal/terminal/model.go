@@ -365,6 +365,9 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 	if newHeight > 0 {
 		fmt.Fprintf(&buf, "\x1b[%d;%dH", newCursorRow+1, newCursorCol+1)
 	}
+	if len(newContinues) > newHeight {
+		newContinues = newContinues[:newHeight]
+	}
 	m.rowContinues = append([]bool(nil), newContinues...)
 	for len(m.rowContinues) < newHeight {
 		m.rowContinues = append(m.rowContinues, false)

@@ -293,7 +293,7 @@ func TestReflowRowsNarrowsAndMapsCursorEndToEnd(t *testing.T) {
 }
 
 func TestReflowRowsWidensAndRejoins(t *testing.T) {
-	rows := []string{"ABCDEF", "GHIJKL"}                     // one logical line at old width 6
+	rows := []string{"ABCDEF", "GHIJKL"}                             // one logical line at old width 6
 	newRows, newRow, newCol, _ := reflowRows(rows, 6, 40, 1, 5, nil) // cursor at row1 col5 = 'L'
 	if len(newRows) != 1 || newRows[0] != "ABCDEFGHIJKL" {
 		t.Fatalf("got %q, want a single rejoined row", newRows)

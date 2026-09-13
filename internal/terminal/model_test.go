@@ -1618,6 +1618,51 @@ func TestSetSizeRowContinuesSurvivesHeightEvictionWithoutPanicking(t *testing.T)
 	}
 }
 
+// TestSetSizeRowContinuesTrimsToHeightOnPassThroughShrink covers a gap
+// found by review: writeReflowedRows built m.rowContinues by copying
+// newContinues and then padding it UP to newHeight if it was shorter,
+// but never trimmed it DOWN if it was already longer. That longer case
+// is reachable through SetSize's pass-through branch (width unchanged,
+// only height changed) — there, newContinues is simply carried over as
+// m.rowContinues from the PREVIOUS (taller) height, while newRows comes
+// from oldRows trimmed down to whatever the render's actual content
+// requires, which can legitimately be shorter than the new height too
+// (so the eviction logic, keyed off len(newRows) vs newHeight, never
+// fires to shorten it either). Left unfixed, m.rowContinues could stay
+// longer than m.height indefinitely, contradicting its own field
+// comment ("length == m.height when trustworthy").
+func TestSetSizeRowContinuesTrimsToHeightOnPassThroughShrink(t *testing.T) {
+	p := &fakePty{}
+	e := &fakeEmulator{}
+	withFakes(t, p, e)
+
+	m := New(1).SetSize(20, 5)
+	m, _ = m.Start()
+
+	// A width-changing resize builds a tracked rowContinues record sized
+	// to the (still tall) height of 5.
+	e.written = []byte(strings.Join([]string{"line0", "line1", "line2", "line3", "line4"}, "\n"))
+	e.cursorX, e.cursorY = 0, 4
+	m = m.SetSize(10, 5)
+	if len(m.rowContinues) != 5 {
+		t.Fatalf("test setup: got len(rowContinues)=%d after the width-changing resize, want 5", len(m.rowContinues))
+	}
+
+	// Now a PASS-THROUGH resize (width stays 10, only height shrinks to
+	// 2) with render content short enough that neither the lastMeaningful
+	// trim nor writeReflowedRows' own eviction-into-shrinkOverflow logic
+	// ever shortens the carried-over rowContinues — the only thing that
+	// can still bring it down to the new height is the trim this test
+	// guards.
+	e.written = []byte("hello")
+	e.cursorX, e.cursorY = 5, 0
+	m = m.SetSize(10, 2)
+
+	if len(m.rowContinues) != m.height {
+		t.Fatalf("got len(rowContinues)=%d after a pass-through height shrink, want %d (== m.height)", len(m.rowContinues), m.height)
+	}
+}
+
 // TestSetSizeSequentialResizesDoNotInsertSpuriousSpaceInWideCharacterContent
 // is the regression test for a Critical bug found in code review of this
 // package's padding-restoration fix (see SetSize's own comment): the fix
