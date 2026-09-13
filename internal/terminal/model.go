@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/xpty"
 
 	"cody/internal/scrollbar"
@@ -67,60 +68,44 @@ type Model struct {
 	// there is no cursor here for it to track — scrolling the terminal
 	// never moves anything the shell itself is doing, only the viewport.
 	scrollOffset int
-	// shrinkOverflow holds rows a height-shrinking SetSize captured
-	// before they would otherwise have been silently destroyed by the
-	// underlying emulator's own resize (see SetSize's doc comment) —
-	// oldest first, rendered as a tier BETWEEN m.emu's own scrollback and
-	// the live screen (see renderScrolledView, ScrollLines): the rows it
+	// shrinkOverflow holds rows evicted by SetSize's unified resize
+	// computation because they no longer fit the new height — oldest
+	// first, rendered as a tier BETWEEN m.emu's own scrollback and the
+	// live screen (see renderScrolledView, ScrollLines): the rows it
 	// holds were on the live screen at capture time, so they are newer
 	// than anything already scrolled into the real scrollback by then,
 	// even though the real scrollback usually holds far more lines
-	// overall (everything that scrolled off before the shrink ever
-	// happened).
+	// overall (everything that scrolled off before this resize ever
+	// happened). Always an append — SetSize's computation is stateless,
+	// re-deriving fresh from the current grid on every call, so there is
+	// no "continuing the same gesture" concept that would ever call for
+	// a prepend.
 	shrinkOverflow []string
-	// shrinkContinuing is true immediately after a shrink-capture and
-	// reset to false the next time the live grid's content is genuinely
-	// perturbed since that capture — either real output being written
-	// (Update's OutputMsg case) or the height growing back (SetSize),
-	// which pads the grid with new, empty rows and so is just as
-	// invalidating as output for this purpose. It exists because a
-	// single user resize gesture
-	// (dragging a real terminal window's edge) typically arrives as MANY
-	// separate, small SetSize calls — one per intermediate size the OS
-	// reports — not one big jump. Each of those calls captures a row
-	// that is OLDER than the row the previous call in the same gesture
-	// captured (the grid keeps shrinking from the same unchanged
-	// content), so consecutive captures within one gesture must be
-	// PREPENDED to stay oldest-first overall; capturing after output has
-	// arrived is a genuinely later, newer batch and must be APPENDED
-	// instead. Without this distinction, a smooth multi-step drag comes
-	// out with its captured rows in exactly reversed order — this is
-	// exactly the difference between the tmux `resize-window` calls this
-	// feature was originally verified against (which deliver one resize
-	// per call, not a smooth multi-step sequence) and a real terminal
-	// emulator's own window-drag behavior.
-	shrinkContinuing bool
-	// widthShrinkSnapshot holds the live grid's rows, captured at the
-	// width they had right before a width-shrinking SetSize, so that a
-	// later regrowth back to at least that width can restore them
-	// losslessly. nil means no snapshot is pending. Unlike shrinkOverflow
-	// (which rescues rows a HEIGHT shrink discards entirely), a width
-	// shrink doesn't remove rows — the same library Resize call
-	// truncates each one in place (see SetSize's own doc comment) — so
-	// this is restored by rewriting the affected rows' live content once
-	// back at width, rather than rendered as an extra tier the way
-	// shrinkOverflow is.
-	widthShrinkSnapshot []string
-	// widthShrinkWidth is the width widthShrinkSnapshot was captured at
-	// — SetSize only restores once the pane has grown back to at least
-	// this width again. Meaningless while widthShrinkSnapshot is nil.
-	widthShrinkWidth int
-	// widthShrinkCursor is the cursor's (column, row) at snapshot time.
-	// The library's own Resize clamps the cursor's column into a
-	// narrower width on shrink and never restores it on a later grow, so
-	// without this the cursor would stay clamped even once there's room
-	// for it again.
-	widthShrinkCursor [2]int
+	// rowContinues holds, for each of the current live rows (same
+	// indexing as the grid itself, length == m.height when
+	// trustworthy), whether that row is a soft-wrap continuation of
+	// the row above it — as determined with certainty by this
+	// package's own last reflow, not guessed from rendered text. nil
+	// means "no trustworthy record for the current grid" (nothing has
+	// been reflowed yet, or real output arrived and invalidated it) —
+	// every consumer must treat nil exactly like "fall back to
+	// isRowFilledToEdge's heuristic," so this can never make behavior
+	// worse than before this field existed, only better. See the
+	// design spec at docs/superpowers/specs/2026-09-11-reflow-continuation-tracking-design.md.
+	rowContinues []bool
+	// rowWrittenWidths holds, for each of the current live rows (same
+	// indexing/lifecycle as rowContinues), the exact display width this
+	// package wrote that row at — ground truth, not an assumption. A
+	// continuation row is not always exactly m.width wide: rewrapLogicalLine
+	// can leave a row one column short when a trailing wide (double-width)
+	// character cluster didn't fit and was carried whole to the next row
+	// (see its own doc comment, pinned by TestRewrapLogicalLineNeverSplitsAWideCluster).
+	// Recording the true written width (rather than assuming m.width) is
+	// what lets SetSize's padding restoration below tell "the emulator
+	// stripped a trailing space" apart from "this row was correctly one
+	// column short" — conflating the two corrupts wide-character content
+	// by inserting a space that was never there.
+	rowWrittenWidths []int
 }
 
 // New creates a terminal session identified by id — a value the caller
@@ -153,36 +138,55 @@ func (m Model) ID() int {
 // the arithmetic right upstream, the same way editor/filetree already
 // floor their own content width before using it.
 //
-// A height SHRINK gets one more step first: the real vt.Emulator's own
-// Resize (charmbracelet/x/vt's Screen.Resize, delegating to
-// ultraviolet's Buffer.Resize) implements a shrink as `Lines =
-// Lines[:height]` — keeping the grid's TOP rows and silently discarding
-// everything below, with no scrollback push of its own. Since the
-// cursor (and therefore the most recently written content — a shell
-// prompt, the tail of whatever was just catted) sits near the BOTTOM of
-// the grid, that's exactly backwards for a shrinking terminal. Capture
-// the rows about to be destroyed ourselves into shrinkOverflow (see its
-// own doc comment for the tier position and the prepend/append
-// distinction) before delegating to the library's own resize —
-// confirmed against the real library, not just reasoned about
-// abstractly (see TestSetSizePreservesRowsLostToARealEmulatorsHeightShrink).
+// Any resize that changes width, height, or both runs one unified
+// computation, protecting BOTH dimensions in the same call — a
+// corner-drag (both dimensions changing on every intermediate step,
+// which is how dragging a window corner actually behaves, not a rare
+// edge case) needs its width protected exactly as much as a single-edge
+// drag does, and an earlier version of this function that skipped width
+// protection whenever height also changed left that gap wide open
+// (confirmed by reproducing real truncation through it).
 //
-// A width SHRINK gets an analogous, but separate, protection:
 // ultraviolet's Buffer.Resize implements a width shrink as
 // `Lines[i] = Lines[i][:width]` for every row — permanently truncating
-// whatever was past the new, narrower column count, with no reflow (the
+// anything past the new column count, with no reflow of its own (the
 // library has no per-row soft-wrap tracking to reflow from — confirmed
-// directly in its source, and confirmed empirically against real
-// terminals like tmux and Ghostty that DO reflow and don't lose this
-// content). Unlike the height case, the row isn't destroyed — its
-// leading content survives — so rather than an extra scrollback-style
-// tier, this snapshots the live grid once at the start of a
-// width-shrinking gesture (widthShrinkSnapshot) and rewrites it back in
-// if the pane widens back out to at least that width before any real
-// output arrives (see restoreWidthShrink). This deliberately only
-// covers a shrink-then-regrow round trip with no output in between —
-// staying narrower, or output arriving mid-drag, still loses content,
-// same as before.
+// directly in its source, and empirically against real terminals like
+// tmux and Ghostty that DO reflow and don't lose this content) — and a
+// height shrink as `Lines = Lines[:height]`, keeping the TOP rows and
+// discarding the rest with no capture of its own. Both are corrected the
+// same way: capture the old grid's rows and cursor before the library's
+// own resize call, reflow them at the new width if width changed
+// (reflowRows in reflow.go — a no-op pass-through if width didn't
+// change), and write the result back afterward (writeReflowedRows)
+// — which already erases every row it touches, so whatever the
+// library's own resize did to cell content along the way is fully
+// overwritten regardless of which dimension(s) changed.
+//
+// writeReflowedRows evicts whatever doesn't fit the new height into
+// shrinkOverflow, oldest first, always keeping the NEWEST rows
+// (including whichever holds the cursor) live — see its own doc
+// comment. This one direction now covers a pure width change, a pure
+// height change, and both together, replacing what used to be two
+// separate mechanisms (a height-only capture with its own
+// gesture-tracking flag, and a width-only reflow) that each only
+// protected one dimension and, in the height-only path's case,
+// evicted the wrong end of the grid — a workaround for the library's
+// own resize always keeping the top, which no longer constrains
+// anything once writeReflowedRows unconditionally overwrites the grid
+// afterward regardless.
+//
+// This runs unconditionally on every resize call, recomputing fresh
+// from the CURRENT grid every time — there is no snapshot to go stale,
+// no "is this still the same gesture" tracking needed, which is what
+// makes a real multi-step drag (many small SetSize calls, one per
+// intermediate size the OS reports) and a single big jump covering the
+// same total resize naturally produce identical results.
+//
+// Skipped entirely while the alt screen (vim, less, ...) is active:
+// Render() would show that app's own UI, not shell history, and
+// capturing or reflowing it here would later surface as unrelated
+// content blended into what's supposed to be main-screen scrollback.
 func (m Model) SetSize(width, height int) Model {
 	if width < 0 {
 		width = 0
@@ -191,84 +195,68 @@ func (m Model) SetSize(width, height int) Model {
 		height = 0
 	}
 	changed := width != m.width || height != m.height
-	if changed && m.emu != nil && m.height > 0 && height < m.height && !m.emu.IsAltScreen() {
-		// The library keeps Lines[:height] (the TOP height rows of the
-		// OLD grid) and discards the rest — so what we must capture is
-		// everything AFTER that same cutoff, liveLines[height:], not
-		// liveLines[:discarded]. Capturing the top instead (an earlier,
-		// wrong version of this fix) grabbed rows the library was never
-		// going to lose while the real victims — the rows nearest the
-		// cursor, typically including the shell prompt — stayed lost;
-		// caught by an independent review that verified the actual
-		// discard direction against the real library directly.
-		//
-		// Skipped entirely while the alt screen (vim, less, ...) is
-		// active: Render() would be showing that app's own UI, not shell
-		// history, and capturing it here would later surface as
-		// unrelated content blended into what's supposed to be
-		// main-screen scrollback.
-		liveLines := strings.Split(m.emu.Render(), "\n")
-		from := max(0, min(height, len(liveLines)))
-		captured := liveLines[from:]
-		// The grid is always full-height, so everything below the
-		// cursor is blank padding, not real content — storing it would
-		// render as empty rows between the real content and the live
-		// screen, and a repeated shrink/grow bounce would spend the
-		// maxShrinkOverflow budget on nothing but blank lines.
-		for len(captured) > 0 && strings.TrimSpace(captured[len(captured)-1]) == "" {
-			captured = captured[:len(captured)-1]
+	doResize := changed && m.emu != nil && m.width > 0 && m.height > 0 && !m.emu.IsAltScreen()
+	var newRows []string
+	var newCursorRow, newCursorCol int
+	var newContinues []bool
+	if doResize {
+		oldRows := strings.Split(m.emu.Render(), "\n")
+		cx, cy := m.emu.CursorPosition()
+		// The grid is always full-height, so any rows below the last
+		// line of real content are blank padding, not something a real
+		// terminal ever actually printed. Trimming down to whichever is
+		// larger — the cursor's own row (it may itself sit on a blank
+		// line) or the last non-blank row — keeps what follows from
+		// treating that padding as content that needs a reserved slot.
+		lastMeaningful := cy
+		for i, row := range oldRows {
+			if i > lastMeaningful && strings.TrimSpace(row) != "" {
+				lastMeaningful = i
+			}
 		}
-		if m.shrinkContinuing {
-			// Still the same resize gesture as the previous capture (no
-			// output has arrived since) — this batch is OLDER than that
-			// one (see shrinkContinuing's own doc comment), so it goes
-			// in front, not at the back.
-			m.shrinkOverflow = append(captured, m.shrinkOverflow...)
+		if lastMeaningful+1 < len(oldRows) {
+			oldRows = oldRows[:lastMeaningful+1]
+		}
+		// The real vt.Emulator strips trailing blank cells when it
+		// renders a row back to a string — indistinguishable, cell by
+		// cell, from a row that just never reached the edge (see
+		// reflow.go's design notes). Whenever m.rowContinues already
+		// knows row i continues row i-1, row i-1 was written by this
+		// package's own last reflow at the width recorded in
+		// m.rowWrittenWidths[i-1] — NOT necessarily m.width itself: a
+		// continuation row can legitimately be one column short of
+		// m.width when a trailing wide (double-width) character
+		// cluster didn't fit and rewrapLogicalLine carried it whole to
+		// the next row instead of splitting it (see rewrapLogicalLine's
+		// own doc comment and TestRewrapLogicalLineNeverSplitsAWideCluster).
+		// Comparing against the RECORDED true width, rather than
+		// assuming m.width, is what tells "the emulator stripped a
+		// trailing space" (shortfall vs. the recorded width) apart from
+		// "this row was correctly one column short already" (no
+		// shortfall vs. the recorded width) — conflating the two would
+		// corrupt wide-character content by padding in a space that was
+		// never there.
+		for i := 1; i < len(oldRows) && i < len(m.rowContinues); i++ {
+			if !m.rowContinues[i] {
+				continue
+			}
+			if i-1 >= len(m.rowWrittenWidths) {
+				continue
+			}
+			if pad := m.rowWrittenWidths[i-1] - ansi.StringWidth(oldRows[i-1]); pad > 0 {
+				oldRows[i-1] += strings.Repeat(" ", pad)
+			}
+		}
+		if width != m.width {
+			newRows, newCursorRow, newCursorCol, newContinues = reflowRows(oldRows, m.width, width, cy, cx, m.rowContinues)
 		} else {
-			m.shrinkOverflow = append(m.shrinkOverflow, captured...)
-		}
-		m.shrinkContinuing = true
-		if excess := len(m.shrinkOverflow) - maxShrinkOverflow; excess > 0 {
-			// The oldest entries are always at index 0 regardless of
-			// which branch above just ran, so trimming the front here is
-			// always correct.
-			m.shrinkOverflow = m.shrinkOverflow[excess:]
-		}
-	} else if changed && height > m.height {
-		// A height GROWTH also breaks the "same shrink gesture" chain,
-		// same as real output does (see shrinkContinuing's own doc
-		// comment) — the library pads the grid with new, empty rows to
-		// reach the larger height, so the live grid is no longer the
-		// same snapshot a later shrink-capture would need to treat as a
-		// continuation. Without this, a shrink/grow/shrink bounce within
-		// one drag (a realistic pattern — real window-drag resize events
-		// aren't always monotonic) could prepend a captured row of blank
-		// padding as if it were OLDER than genuinely older content
-		// already sitting in shrinkOverflow. A width-only change does
-		// NOT reset this — it doesn't touch the grid vertically, so it
-		// can't invalidate a shrink chain the same way.
-		m.shrinkContinuing = false
-	}
-	if changed && m.emu != nil && m.width > 0 && !m.emu.IsAltScreen() {
-		switch {
-		case height != m.height:
-			// A simultaneous height change invalidates any pending
-			// width snapshot — restoring specific row indices only
-			// makes sense if the row layout hasn't also shifted
-			// underneath it since capture. A later, width-only step
-			// can start a fresh snapshot of its own.
-			m.widthShrinkSnapshot = nil
-		case width < m.width && m.widthShrinkSnapshot == nil:
-			// First width-shrink step of a new gesture: capture the
-			// widest (current, undamaged) state before it's destroyed.
-			// A later step within the same gesture (widthShrinkSnapshot
-			// already set) must NOT overwrite this — that would replace
-			// the recoverable pre-gesture content with content that's
-			// already been narrowed once.
-			m.widthShrinkSnapshot = strings.Split(m.emu.Render(), "\n")
-			m.widthShrinkWidth = m.width
-			cx, cy := m.emu.CursorPosition()
-			m.widthShrinkCursor = [2]int{cx, cy}
+			// Width didn't change — nothing to rewrap. The old rows,
+			// cursor position, and known continuation bits all pass
+			// through unchanged; writeReflowedRows below still handles
+			// a height change on its own (evicting excess into
+			// shrinkOverflow if the new height is smaller).
+			newRows, newCursorRow, newCursorCol = oldRows, cy, cx
+			newContinues = m.rowContinues
 		}
 	}
 	m.width, m.height = width, height
@@ -280,59 +268,124 @@ func (m Model) SetSize(width, height int) Model {
 			m.emu.Resize(width, height)
 		}
 	}
-	if changed && m.emu != nil && m.widthShrinkSnapshot != nil && width >= m.widthShrinkWidth && !m.emu.IsAltScreen() {
-		// Only reachable once the grid has actually been resized wider
-		// above — restoring needs the room to write the snapshot's
-		// longer rows back into.
-		m = m.restoreWidthShrink()
+	if doResize {
+		m = m.writeReflowedRows(newRows, newCursorRow, newCursorCol, height, newContinues)
 	}
 	return m
 }
 
-// restoreWidthShrink rewrites the live grid's rows from
-// widthShrinkSnapshot, then repositions the cursor to where it was at
-// snapshot time (see widthShrinkCursor's own doc comment for why that's
-// necessary). Each captured row is itself a self-contained, already
-// ANSI-styled render (see Emulator.Render/ScrollbackLine) that resets
-// any style/hyperlink it opened before ending, so writing them back
-// to back on separate rows can't bleed style state between them.
+// writeReflowedRows writes newRows (already computed at the new width
+// by reflowRows) into the live grid — which by the time this runs has
+// already been resized to its final width/height — and repositions the
+// cursor to (newCursorRow, newCursorCol), matching reflowRows' own
+// (row, col) return order. Every row it touches is erased before being
+// written, and every row from len(newRows) through newHeight-1 is
+// erased outright: reflow recomputes the grid's whole content, so
+// anything already there is stale by construction and writing over it
+// without erasing leaves the old, longer content showing through (see
+// the row loops' own comments). Rows beyond newHeight are appended into
+// m.shrinkOverflow (see its own doc comment) rather than discarded,
+// mirroring how a real terminal pushes reflow overflow into scrollback:
+// this is always an append, never a prepend, since reflow has no
+// "continuing the same gesture" concept (see reflowRows' own doc
+// comment) — every call's overflow is, by construction, a fresh batch
+// relative to whatever shrinkOverflow already holds.
 //
-// Only rows whose CURRENT content is still consistent with having been
-// truncated from the snapshot are actually rewritten — checked here,
-// per row, rather than by invalidating the whole snapshot the moment any
-// output arrives (SetSize's own doc comment used to do that, and the
-// caller no longer does). Real interactive shells commonly redraw their
-// own prompt line in response to the very resize that shrank the pane —
-// confirmed against a real zsh session, not just reasoned about — and
-// that redraw is ordinary output with no way to tell it apart from
-// anything else a program might write. Invalidating on ANY output meant
-// this almost never actually fired: the redraw typically arrives before
-// the pane ever widens back out. A row nothing wrote to still has
-// exactly its pre-shrink content truncated to whatever width it was
-// narrowed to, which is always a prefix of the wider snapshot; a row
-// that's diverged for any other reason (redrawn, or genuinely new
-// output) generally won't be, and is left alone rather than clobbered.
-func (m Model) restoreWidthShrink() Model {
-	currentLines := strings.Split(m.emu.Render(), "\n")
+// newContinues carries the known-continuation bits for newRows (see
+// reflowRows' own doc comment) — shifted/trimmed here in lockstep with
+// newRows whenever excess rows get evicted into shrinkOverflow, then
+// stored as the new m.rowContinues (padded with false for any row from
+// len(newRows) through newHeight-1, since blank padding is never a
+// continuation of anything). This is what lets the NEXT SetSize call
+// trust this resize's own output instead of re-deriving it from
+// rendered strings — see the design spec at
+// docs/superpowers/specs/2026-09-11-reflow-continuation-tracking-design.md.
+// m.rowWrittenWidths is derived the same way, from newRows AFTER the
+// eviction shift below (so it naturally lines up with the same, already
+// -shifted rows, with no separate slice to shift in parallel) — see its
+// own field doc comment on Model for why the true written width, not
+// m.width, must be what SetSize compares against later.
+func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, newHeight int, newContinues []bool) Model {
+	if excess := len(newRows) - newHeight; excess > 0 {
+		beforeOverflowLen := len(m.shrinkOverflow)
+		m.shrinkOverflow = append(m.shrinkOverflow, newRows[:excess]...)
+		if over := len(m.shrinkOverflow) - maxShrinkOverflow; over > 0 {
+			m.shrinkOverflow = m.shrinkOverflow[over:]
+		}
+		// Pin a paused viewport the same way Update's OutputMsg case
+		// already does when real output grows the combined buffer
+		// underneath it: the combined buffer (scrollback + shrinkOverflow
+		// + live) just grew by however much of this batch actually stuck
+		// (after the maxShrinkOverflow trim above may have dropped some
+		// of it from the front), so scrollOffset must grow by the same
+		// amount, or renderScrolledView's paused viewport silently drifts
+		// toward the live tail even though the user never asked it to.
+		if m.scrollOffset > 0 {
+			m.scrollOffset += len(m.shrinkOverflow) - beforeOverflowLen
+		}
+		newRows = newRows[excess:]
+		if excess <= len(newContinues) {
+			newContinues = newContinues[excess:]
+		} else {
+			newContinues = nil
+		}
+		newCursorRow -= excess
+	}
+	if newCursorRow < 0 {
+		newCursorRow = 0
+	}
+	if newHeight > 0 && newCursorRow >= newHeight {
+		newCursorRow = newHeight - 1
+	}
 	var buf strings.Builder
-	restoredAny := false
-	for i, snapshotLine := range m.widthShrinkSnapshot {
-		if i >= m.height || i >= len(currentLines) {
+	for i, row := range newRows {
+		if i >= newHeight {
 			break
 		}
-		current := strings.TrimRight(currentLines[i], " ")
-		if !strings.HasPrefix(snapshotLine, current) {
-			continue
+		// \x1b[K (erase to end of line) before the content: reflow
+		// recomputes the WHOLE content of every row it touches, so
+		// anything already sitting in this row is stale by
+		// construction. Writing without erasing leaves whatever the
+		// row held before showing past the end of the new, shorter
+		// content — e.g. rewrapping "1234567890"/"abcde" from width 10
+		// to 12 writes "cde" over the old "abcde" and leaves "cdede".
+		fmt.Fprintf(&buf, "\x1b[%d;1H\x1b[K%s", i+1, row)
+	}
+	// Rows the reflow doesn't reach at all still hold the PREVIOUS
+	// wrapping and must be blanked too, or content that just rejoined
+	// into fewer, wider rows above stays visible below as a stale
+	// duplicate of itself (the design spec's §5 states freed rows are
+	// left blank — this is what makes that true). Safe to erase
+	// unconditionally: SetSize already trimmed reflowRows' input down to
+	// the last meaningful row, so everything past newRows was blank
+	// padding anyway.
+	for i := len(newRows); i < newHeight; i++ {
+		fmt.Fprintf(&buf, "\x1b[%d;1H\x1b[K", i+1)
+	}
+	if newHeight > 0 {
+		fmt.Fprintf(&buf, "\x1b[%d;%dH", newCursorRow+1, newCursorCol+1)
+	}
+	if len(newContinues) > newHeight {
+		newContinues = newContinues[:newHeight]
+	}
+	m.rowContinues = append([]bool(nil), newContinues...)
+	for len(m.rowContinues) < newHeight {
+		m.rowContinues = append(m.rowContinues, false)
+	}
+	// rowWrittenWidths records the TRUE display width each row of
+	// newRows was actually written at — ground truth for SetSize's
+	// padding-restoration on the NEXT resize (see its own doc comment
+	// and rowWrittenWidths' own field comment on Model). Rows beyond
+	// len(newRows) are blank padding, never a continuation of anything,
+	// so width 0 there is never consulted.
+	m.rowWrittenWidths = make([]int, newHeight)
+	for i, row := range newRows {
+		if i >= newHeight {
+			break
 		}
-		fmt.Fprintf(&buf, "\x1b[%d;1H%s", i+1, snapshotLine)
-		restoredAny = true
+		m.rowWrittenWidths[i] = ansi.StringWidth(row)
 	}
-	if restoredAny {
-		fmt.Fprintf(&buf, "\x1b[%d;%dH", m.widthShrinkCursor[1]+1, m.widthShrinkCursor[0]+1)
-		m.emu.Write([]byte(buf.String()))
-	}
-	m.widthShrinkSnapshot = nil
-	m.widthShrinkWidth = 0
+	m.emu.Write([]byte(buf.String()))
 	return m
 }
 
@@ -444,20 +497,17 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			beforeLen = m.emu.ScrollbackLen()
 		}
 		m.emu.Write(msg.data)
-		// Real output arrived — any later shrink-capture is a genuinely
-		// newer batch than whatever's already in shrinkOverflow, not a
-		// continuation of the same resize gesture (see shrinkContinuing's
-		// own doc comment).
-		m.shrinkContinuing = false
-		// A pending width-shrink snapshot is deliberately NOT invalidated
-		// here — see restoreWidthShrink's own doc comment for why a
-		// per-row check at restore time, rather than a blanket
-		// any-output-invalidates rule, is what's actually needed: a
-		// shell's own prompt commonly redraws itself in response to the
-		// same resize (confirmed against a real interactive zsh session,
-		// not just reasoned about), which is ordinary output arriving
-		// here — invalidating on that would mean the rescue almost never
-		// actually fires in practice.
+		// Any real output can change rows this package previously
+		// tracked as reflow continuations in ways it has no visibility
+		// into (new content, a redraw, a prompt repaint) — the tracked
+		// record can only be trusted for a resize-only sequence with
+		// nothing typed in between, so it must not survive past this
+		// point. The next SetSize call falls back to the heuristic for
+		// this content (identical to today's behavior) and rebuilds a
+		// fresh, trustworthy record from there for any FURTHER resize
+		// in the same drag.
+		m.rowContinues = nil
+		m.rowWrittenWidths = nil
 		switch {
 		case wasAltScreen && !m.emu.IsAltScreen():
 			// The alt screen (vim, less, ...) just exited as part of this
@@ -541,12 +591,14 @@ var scrollbarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 // emulator's own scrollback (ScrollbackLen/ScrollbackLine — normally far
 // more content than a single shrink ever captures, everything that
 // scrolled off before the shrink happened), then m.shrinkOverflow (rows a
-// height shrink would otherwise have destroyed — see SetSize — which
-// were still on the live screen at capture time, making them newer than
-// whatever was already in scrollback then), then the live screen's own
-// rows. The live screen's individual rows come from splitting Render()'s
-// own output on "\n" — safe because ANSI SGR/CSI escape sequences never
-// contain a raw newline byte.
+// resize would otherwise have destroyed — either a height shrink, see
+// SetSize, or a width-only reflow needing more rows than the current
+// height holds, see writeReflowedRows — which were still on the live
+// screen at capture time, making them newer than whatever was already in
+// scrollback then), then the live screen's own rows. The live screen's
+// individual rows come from splitting Render()'s own output on "\n" —
+// safe because ANSI SGR/CSI escape sequences never contain a raw
+// newline byte.
 func (m Model) renderScrolledView() string {
 	liveLines := strings.Split(m.emu.Render(), "\n")
 	overflowLen := len(m.shrinkOverflow)

@@ -186,11 +186,20 @@ send the matching escape sequence.
 - Scrollback holds up to 10,000 lines per tab; generating output far past that
   cap while scrolled up can very slightly drift the paused view, since the
   oldest lines get evicted out from under it (extremely unlikely in practice).
-- Narrowing the pane permanently truncates already-printed lines past the new
-  width — the underlying terminal library has no text-reflow support, so
-  there's nothing to restore the trimmed characters from once it's widened
-  back out. A best-effort rescue restores a row if nothing has written to it
-  since the shrink, but an interactive shell's own prompt commonly redraws
-  (and can even scroll) in response to the very resize that shrank the pane,
-  which defeats the rescue for whatever it touches. Full text reflow would
-  fix this properly; tracked as future work.
+- Reflow re-wraps already-printed content on every width change, so
+  narrowing and widening the pane generally preserves text that a plain
+  resize would have truncated. It relies on a heuristic — a row whose
+  rendered content fills the pane's full width is assumed to be
+  soft-wrapped into the row below — rather than the underlying library
+  tracking wrapping explicitly, and that heuristic can misjudge in
+  either direction: content that fills the full width without actually
+  being wrapped (a box-drawing border exactly as wide as the pane) gets
+  joined with the row after it, while a row that genuinely did wrap but
+  ends on a blank cell (common in prose, where the wrap point often
+  lands just after a space) measures narrower than the full width and is
+  never rejoined on a later widen. Both are known limitations of working
+  from rendered rows rather than raw terminal cells. Content that scrolls
+  off the pane's visible area (from a height shrink or from reflow
+  running out of room) is also never re-wrapped again by a later resize
+  — it stays wrapped at whatever width it was at when it scrolled off,
+  same as real terminal scrollback.

@@ -34,11 +34,13 @@ type Emulator interface {
 	// CursorPosition returns the cursor's current (column, row), both
 	// 0-indexed. Exposed as plain ints rather than vt/uv's own Position
 	// type (a plain image.Point) for the same reason as
-	// ScrollbackLen/ScrollbackLine above — this package's own resize
-	// handling needs it to snapshot/restore the cursor around a
-	// width-shrinking resize (see SetSize's own doc comment): the
-	// library's Resize clamps the cursor's column into a narrower width
-	// and never restores it on a later grow.
+	// ScrollbackLen/ScrollbackLine above — reflow needs it to map the
+	// cursor through a width change (see reflowRows and cursorOffset in
+	// reflow.go): the cursor's physical (row, column) means something
+	// different at every width, so reflow converts it into an offset
+	// within its own logical line before rewrapping and back into
+	// physical coordinates afterward, which is impossible without
+	// knowing where it started.
 	CursorPosition() (x, y int)
 }
 
