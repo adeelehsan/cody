@@ -141,6 +141,14 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 
 (Exact placement/trimming details are for the implementation plan; the principle is "shift/trim `newContinues` in lockstep with `newRows`, pad the rest false, store the result as the new `m.rowContinues`.")
 
+### Amendment: `rowWrittenWidths` — why join-decision tracking alone wasn't enough
+
+Implementation surfaced a gap in the design as originally written: knowing *that* row `i` continues row `i-1` (via `rowContinues`) is not enough to reconstruct row `i-1`'s TRUE content, because `oldRows` is re-derived from `m.emu.Render()` on every `SetSize` call, and the real emulator strips a row's trailing blank cell on every render — even when the row is known, with certainty, to be a genuine wrap-fill. A correctly-forced join still concatenates two already-stripped strings, and the boundary space stays lost.
+
+The fix adds a second field, `Model.rowWrittenWidths []int`, with the identical lifecycle to `rowContinues` (built in `writeReflowedRows`, invalidated to `nil` on `OutputMsg`): the exact display width this package wrote each row at, recorded as ground truth rather than assumed. `SetSize`'s padding-restoration step compares a row's current (possibly-stripped) rendered width against its RECORDED true width — not against `m.width` — and pads back exactly the difference.
+
+This distinction matters because a continuation row is not always exactly `m.width` wide: `rewrapLogicalLine` (reflow.go) legitimately leaves a row one column short of the target width when a trailing wide (double-width) character cluster doesn't fit and gets carried whole to the next row instead of being split. An earlier version of this fix assumed every continuation row was exactly `m.width` wide and padded any shortfall back up to that — which is correct for the ASCII/stripped-space case, but WRONG for the wide-character case, where it inserts a space that was never there (verified: `"你好世界"` through a narrowing resize sequence produced `"你 好"` under the `m.width`-based version). Recording and comparing against the row's own true written width fixes both cases without needing to distinguish them by any other means.
+
 ### Invalidation
 
 Any real output reaching the emulator must invalidate the record — this package cannot safely assume rows it once reflowed are still whatever it left them as once the shell (or an alt-screen app) has written more:
