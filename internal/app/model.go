@@ -134,6 +134,20 @@ type Model struct {
 	paletteCursor  int
 	searchInput    textinput.Model
 
+	// prefTreeWidth, prefTerminalHeight and prefSplitCol are the sizes the
+	// user last CHOSE for those boundaries (the defaults, until a drag
+	// says otherwise) — as opposed to treeWidth/terminalHeight/splitCol,
+	// the sizes currently in effect. The two differ whenever the window
+	// is too small to honor the preference: a WindowSizeMsg re-derives
+	// the effective size by clamping the PREFERENCE to the new window,
+	// never by re-clamping the previous effective size — which would
+	// turn every window shrink into a permanent one (shrink the window
+	// to nothing and back, and the terminal pane stayed at its one-row
+	// minimum with everything it had been showing squeezed out of view).
+	prefTreeWidth      int
+	prefTerminalHeight int
+	prefSplitCol       int
+
 	pendingConfirm     confirmAction
 	pendingConfirmPane int // meaningful only when pendingConfirm == confirmCloseTab
 	pendingConfirmTab  int // meaningful only when pendingConfirm == confirmCloseTab
@@ -168,6 +182,9 @@ func New(rootPath string, nerdFont bool) (Model, error) {
 		commands:       buildCommands(),
 		treeWidth:      defaultTreeWidth,
 		terminalHeight: defaultTerminalHeight,
+
+		prefTreeWidth:      defaultTreeWidth,
+		prefTerminalHeight: defaultTerminalHeight,
 	}, nil
 }
 
@@ -321,6 +338,7 @@ func (m Model) moveTabToOtherPane(pane, index int) Model {
 	if len(m.panes) == 1 {
 		m.panes = append(m.panes, editorPane{activeTab: -1})
 		m.splitCol = m.defaultSplitCol()
+		m.prefSplitCol = m.splitCol
 	}
 	target := 1 - pane
 	moved := m.panes[pane].tabs[index]
@@ -420,13 +438,15 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if sz, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width, m.height = sz.Width, sz.Height
-		// Re-clamp any pane sizes the user dragged away from their
-		// defaults: a resize the user made at the old window size could
-		// now overflow (or invert) the new one.
-		m.treeWidth = m.clampTreeWidth(m.treeWidth)
-		m.terminalHeight = m.clampTerminalHeight(m.terminalHeight)
+		// Re-derive each pane size from the user's PREFERENCE, clamped
+		// to the new window: a size chosen at the old window size could
+		// now overflow (or invert) the new one — and one clamped down
+		// by a smaller window must come back once there's room again
+		// (see prefTreeWidth's own doc comment).
+		m.treeWidth = m.clampTreeWidth(m.prefTreeWidth)
+		m.terminalHeight = m.clampTerminalHeight(m.prefTerminalHeight)
 		if len(m.panes) == 2 {
-			m.splitCol = m.clampSplitCol(m.splitCol)
+			m.splitCol = m.clampSplitCol(m.prefSplitCol)
 		}
 		// A resize can also invalidate an open tab menu's anchor the same
 		// way narrowing a pane's tab bar via a drag can (see
@@ -971,12 +991,15 @@ func (m Model) applyResizeDrag(x, y int) Model {
 	switch m.resizeDrag {
 	case resizeTree:
 		m.treeWidth = m.clampTreeWidth(x + 1)
+		m.prefTreeWidth = m.treeWidth
 		// Dragging the tree border can push m.treeWidth past the split
 		// boundary the same way a window resize can (clampTreeWidth only
 		// knows about minEditorWidth, not m.splitCol) — re-clamp so the
-		// split can't invert.
+		// split can't invert. From the preference, like a window resize:
+		// the tree pushing the split aside isn't the user choosing a new
+		// split position.
 		if len(m.panes) == 2 {
-			m.splitCol = m.clampSplitCol(m.splitCol)
+			m.splitCol = m.clampSplitCol(m.prefSplitCol)
 		}
 	case resizeTerminal:
 		_, _, term := m.paneLayout()
@@ -988,8 +1011,10 @@ func (m Model) applyResizeDrag(x, y int) Model {
 		// moved at all. The -1 cancels that anchor offset: pressing and
 		// releasing without moving leaves terminalHeight unchanged.
 		m.terminalHeight = m.clampTerminalHeight(term.terminal.y1 - y - 1)
+		m.prefTerminalHeight = m.terminalHeight
 	case resizeEditorSplit:
 		m.splitCol = m.clampSplitCol(x)
+		m.prefSplitCol = m.splitCol
 	}
 	// Propagate the new geometry into every pane's persisted editor state
 	// immediately, the same way WindowSizeMsg does (see resizeAllPanes'

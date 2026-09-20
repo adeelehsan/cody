@@ -2891,3 +2891,56 @@ func TestBeginResizeDragNoLongerTreatsTheTerminalTabBarsOwnRowAsABoundary(t *tes
 		t.Fatal("expected beginResizeDrag to no longer treat the terminal tab bar's own row as a resize boundary — that row is exclusively tab-bar-click territory now, reached only through Update's own priority check before beginResizeDrag is ever tried")
 	}
 }
+
+// TestWindowShrinkDoesNotPermanentlyShrinkThePanes: shrinking the window
+// below what the panes need clamps the tree width and terminal height
+// down to fit — but that clamp is a consequence of the window's size at
+// that moment, not something the user asked for. Growing the window
+// back must bring both panes back to the sizes they had, not leave the
+// terminal stuck at its one-row minimum (with everything it was showing
+// squeezed out of view) until someone drags it open again by hand.
+func TestWindowShrinkDoesNotPermanentlyShrinkThePanes(t *testing.T) {
+	m, err := New(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 150, Height: 45})
+	m = updated.(Model)
+	wantTree, wantTerm := m.treeWidth, m.terminalHeight
+
+	for _, sz := range []tea.WindowSizeMsg{{Width: 60, Height: 15}, {Width: 20, Height: 6}, {Width: 2, Height: 2}, {Width: 20, Height: 6}, {Width: 150, Height: 45}} {
+		updated, _ = m.Update(sz)
+		m = updated.(Model)
+	}
+	if m.treeWidth != wantTree || m.terminalHeight != wantTerm {
+		t.Fatalf("got treeWidth=%d terminalHeight=%d after shrinking the window and restoring it, want the original %d/%d back", m.treeWidth, m.terminalHeight, wantTree, wantTerm)
+	}
+}
+
+// TestWindowShrinkKeepsADraggedPaneSizeAsThePreference: the size a pane
+// returns to after a window shrink is the one the user last dragged it
+// to, not the built-in default.
+func TestWindowShrinkKeepsADraggedPaneSizeAsThePreference(t *testing.T) {
+	m, err := New(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 150, Height: 45})
+	m = updated.(Model)
+
+	m.resizeDrag = resizeTerminal
+	_, _, term := m.paneLayout()
+	m = m.applyResizeDrag(80, term.terminal.y1-1-20) // drag the terminal open to 20 rows
+	m.resizeDrag = resizeNone
+	if m.terminalHeight != 20 {
+		t.Fatalf("test setup: got terminalHeight=%d after the drag, want 20", m.terminalHeight)
+	}
+
+	for _, sz := range []tea.WindowSizeMsg{{Width: 40, Height: 10}, {Width: 150, Height: 45}} {
+		updated, _ = m.Update(sz)
+		m = updated.(Model)
+	}
+	if m.terminalHeight != 20 {
+		t.Fatalf("got terminalHeight=%d after shrinking the window and restoring it, want the dragged 20 back", m.terminalHeight)
+	}
+}
