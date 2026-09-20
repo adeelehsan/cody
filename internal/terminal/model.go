@@ -459,17 +459,28 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 // ever consulted through a tracked bit i+1, which this rule already
 // ties to row i being unchanged.
 //
-// The scroll shift is read off the scrollback's growth. Once the
-// library's scrollback is at its cap it stops growing, the shift reads
-// as 0, and scrolled rows just fail to match — conservative, not wrong.
-// A shrinking scrollback (cleared) or the alt screen coming up drops
-// the record outright.
-func (m Model) retrackRowsAfterOutput(beforeRows []string, beforeScrollbackLen int) Model {
+// The scroll shift is read off the scrollback's growth — exact until
+// the library's scrollback reaches its cap, where every line pushed in
+// evicts one from the other end and growth under-reports the shift (or
+// reads 0). Rows compared at the wrong offset mostly just fail to match,
+// but repeated identical rows could match and inherit an unrelated
+// row's state. The eviction itself is the tell: below the cap the
+// OLDEST scrollback line (beforeOldestScrollback, captured alongside
+// beforeRows) never changes, so if it did, the shift is unknowable and
+// the record is dropped. A write that doesn't scroll — the SIGWINCH
+// prompt redraw this all exists for — is unaffected at any scrollback
+// size. (Evicted lines textually identical to their successors slip
+// past this check; what's left is then the same bounded, heuristic-
+// class misjudgment described above, needing a second coincidence on
+// top.) A shrinking scrollback (cleared) or the alt screen coming up
+// drops the record outright too.
+func (m Model) retrackRowsAfterOutput(beforeRows []string, beforeScrollbackLen int, beforeOldestScrollback string) Model {
 	if m.rowTracked == nil {
 		return m
 	}
 	shift := m.emu.ScrollbackLen() - beforeScrollbackLen
-	if beforeRows == nil || shift < 0 || m.emu.IsAltScreen() {
+	evicted := beforeScrollbackLen > 0 && m.emu.ScrollbackLine(0) != beforeOldestScrollback
+	if beforeRows == nil || shift < 0 || evicted || m.emu.IsAltScreen() {
 		m.rowContinues, m.rowWrittenWidths, m.rowTracked = nil, nil, nil
 		return m
 	}
@@ -614,11 +625,13 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		// preserve — a session that has never been resized (or whose
 		// record has fully aged out) pays nothing extra per write.
 		var beforeRows []string
+		var beforeOldest string
 		if m.rowTracked != nil && !wasAltScreen {
 			beforeRows = strings.Split(m.emu.Render(), "\n")
+			beforeOldest = m.emu.ScrollbackLine(0)
 		}
 		m.emu.Write(msg.data)
-		m = m.retrackRowsAfterOutput(beforeRows, beforeLen)
+		m = m.retrackRowsAfterOutput(beforeRows, beforeLen, beforeOldest)
 		switch {
 		case wasAltScreen && !m.emu.IsAltScreen():
 			// The alt screen (vim, less, ...) just exited as part of this

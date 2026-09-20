@@ -1,6 +1,10 @@
 package terminal
 
-import "github.com/charmbracelet/x/ansi"
+import (
+	"strings"
+
+	"github.com/charmbracelet/x/ansi"
+)
 
 // isRowFilledToEdge reports whether row's rendered content occupies the
 // terminal's full display width — the wrap-detection heuristic this
@@ -221,9 +225,33 @@ func reflowRows(rows []string, oldWidth, newWidth, cursorRow, cursorCol int, kno
 	lines, counts := groupIntoLogicalLinesKnown(rows, oldWidth, known)
 	cursorLine, offset := cursorOffset(rows, counts, cursorRow, cursorCol)
 	for li, line := range lines {
+		if li == cursorLine {
+			// A cursor past the end of its line's rendered content is
+			// sitting after blank cells the emulator stripped on render
+			// (a prompt's trailing space is the everyday case — see
+			// cursorAfterRewrap). Put them back before rewrapping, so
+			// they wrap like the real cells they are instead of the
+			// cursor's column being patched up afterward.
+			if pad := offset - ansi.StringWidth(line); pad > 0 {
+				line += strings.Repeat(" ", pad)
+			}
+		}
 		rewrapped := rewrapLogicalLine(line, newWidth)
 		if li == cursorLine {
 			r, c := cursorAfterRewrap(rewrapped, offset)
+			if newWidth > 0 && c >= newWidth {
+				// The cursor's line now ends exactly at the pane's
+				// right edge with the cursor just past it. The grid has
+				// no such column: positioning the cursor there clamps
+				// it back ONTO the last cell, and the next character
+				// typed overwrites that cell instead of following it. A
+				// real terminal would be in its pending-wrap state here
+				// — next character goes to column 0 of the next row —
+				// so give the line that (empty) continuation row now and
+				// put the cursor on it.
+				rewrapped = append(rewrapped, "")
+				r, c = len(rewrapped)-1, 0
+			}
 			newCursorRow = len(newRows) + r
 			newCursorCol = c
 		}

@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/vt"
 )
 
 type fakePty struct {
@@ -1506,12 +1507,18 @@ func TestSetSizeSequentialResizesDoNotDropAWordBoundarySpace(t *testing.T) {
 		t.Fatalf("repro premise broken: row %q unexpectedly measures filled-to-edge at width 46 — this test needs updating, it is no longer exercising the missed-join ambiguity", firstRowAt46)
 	}
 
-	widths := []struct{ w, h int }{
-		{110, 34}, {102, 33}, {94, 32}, {86, 31}, {78, 30},
-		{70, 29}, {62, 28}, {54, 27}, {46, 26}, {38, 25},
-		{30, 24}, {28, 23}, {30, 24}, {38, 25}, {46, 26},
-		{54, 27}, {62, 28}, {70, 29}, {78, 30}, {86, 31},
-		{94, 32}, {102, 33}, {110, 34}, {118, 35},
+	// 46 steps, both dimensions changing on every one: 118x58 down to
+	// 26x35 and back — denser than the 30-step floor CLAUDE.md sets for
+	// resize verification, since compounding can surface late.
+	var widths []struct{ w, h int }
+	for w, h := 114, 57; w >= 26; w, h = w-4, h-1 {
+		widths = append(widths, struct{ w, h int }{w, h})
+	}
+	for w, h := 30, 36; w <= 118; w, h = w+4, h+1 {
+		widths = append(widths, struct{ w, h int }{w, h})
+	}
+	if len(widths) < 30 {
+		t.Fatalf("test setup: got %d resize steps, want 30+", len(widths))
 	}
 	for _, wh := range widths {
 		m = m.SetSize(wh.w, wh.h)
@@ -1565,7 +1572,7 @@ func TestSetSizeDenseResizeSurvivesShellPromptRedrawAfterEveryStep(t *testing.T)
 	newPty = func(width, height int) (Pty, error) { return p, nil }
 	t.Cleanup(func() { newPty = origPty })
 
-	m := New(1).SetSize(118, 35)
+	m := New(1).SetSize(118, 58)
 	m, _ = m.Start()
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -1581,12 +1588,18 @@ func TestSetSizeDenseResizeSurvivesShellPromptRedrawAfterEveryStep(t *testing.T)
 	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(text)})
 	m = updated
 
-	widths := []struct{ w, h int }{
-		{110, 34}, {102, 33}, {94, 32}, {86, 31}, {78, 30},
-		{70, 29}, {62, 28}, {54, 27}, {46, 26}, {38, 25},
-		{30, 24}, {28, 23}, {30, 24}, {38, 25}, {46, 26},
-		{54, 27}, {62, 28}, {70, 29}, {78, 30}, {86, 31},
-		{94, 32}, {102, 33}, {110, 34}, {118, 35},
+	// 46 steps, both dimensions changing on every one: 118x58 down to
+	// 26x35 and back — denser than the 30-step floor CLAUDE.md sets for
+	// resize verification, since compounding can surface late.
+	var widths []struct{ w, h int }
+	for w, h := 114, 57; w >= 26; w, h = w-4, h-1 {
+		widths = append(widths, struct{ w, h int }{w, h})
+	}
+	for w, h := 30, 36; w <= 118; w, h = w+4, h+1 {
+		widths = append(widths, struct{ w, h int }{w, h})
+	}
+	if len(widths) < 30 {
+		t.Fatalf("test setup: got %d resize steps, want 30+", len(widths))
 	}
 	for _, wh := range widths {
 		m = m.SetSize(wh.w, wh.h)
@@ -1690,6 +1703,115 @@ func TestUpdateOutputThatScrollsShiftsTheTrackedRecordWithTheContent(t *testing.
 	}
 	if !m.rowContinues[0] {
 		t.Fatalf("got rowContinues[0]=false, want the continuation bit of what was row 2 carried up with it")
+	}
+}
+
+// TestUpdateScrollingOutputAtScrollbackCapDropsTheTrackedRecord: the
+// scroll shift is read off the scrollback's growth, which stops being
+// exact once the scrollback is full — each line pushed in evicts one
+// from the far end, so growth under-reports (here: reads 0 for a real
+// 2-line scroll). Rows compared at that wrong offset could match by
+// coincidence (repeated content) and inherit an unrelated row's state,
+// so a write that evicts must drop the record instead. A write that
+// doesn't scroll — the SIGWINCH prompt redraw — must keep working at
+// any scrollback size, or the whole fix would quietly switch itself
+// off in any long-lived session.
+func TestUpdateScrollingOutputAtScrollbackCapDropsTheTrackedRecord(t *testing.T) {
+	p := &fakePty{}
+	origPty := newPty
+	newPty = func(width, height int) (Pty, error) { return p, nil }
+	t.Cleanup(func() { newPty = origPty })
+	origEmu := newEmulator
+	newEmulator = func(width, height int) Emulator {
+		e := vt.NewEmulator(width, height)
+		e.Scrollback().SetMaxLines(3)
+		return vtEmulator{e}
+	}
+	t.Cleanup(func() { newEmulator = origEmu })
+
+	m := New(1).SetSize(40, 4)
+	m, _ = m.Start()
+	t.Cleanup(func() { _ = m.Close() })
+
+	// Distinct lines fill the 3-line scrollback to its cap; the live
+	// screen then holds REPEATED rows — the case where comparing at the
+	// wrong offset matches anyway.
+	fill := "u\r\nv\r\nw\r\nx\r\ny\r\nsame\r\nsame\r\nsame\r\n$ "
+	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(fill)})
+	m = updated
+	if got := m.emu.ScrollbackLen(); got != 3 {
+		t.Fatalf("test setup: got scrollback len %d, want it at its cap of 3", got)
+	}
+
+	m = m.SetSize(30, 4)
+	if m.rowTracked == nil {
+		t.Fatalf("test setup: got no tracked record after a reflow")
+	}
+
+	updated, _ = m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte("\r\r\x1b[J$ ")})
+	m = updated
+	if m.rowTracked == nil {
+		t.Fatalf("got the tracked record dropped by a non-scrolling prompt redraw at the scrollback cap, want it kept")
+	}
+
+	// Turn the prompt row into another "same" and scroll by one: the
+	// screen ends up rendering exactly as before.
+	beforeView, beforeLen := m.View(), m.emu.ScrollbackLen()
+	updated, _ = m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte("\r\x1b[Ksame\r\n$ ")})
+	m = updated
+	if m.View() != beforeView || m.emu.ScrollbackLen() != beforeLen {
+		t.Fatalf("test setup: want a 1-line scroll invisible to both the rendered rows and the scrollback length; got view %q -> %q, len %d -> %d", beforeView, m.View(), beforeLen, m.emu.ScrollbackLen())
+	}
+	if m.rowTracked != nil {
+		t.Fatalf("got rowTracked=%v after output that scrolled at the scrollback cap, want the record dropped — every row matched at shift 0, but the real shift was 1 and is unknowable", m.rowTracked)
+	}
+}
+
+// TestSetSizeCursorLandingExactlyAtTheNewRightEdgeMovesToAContinuationRow
+// covers both ways a cursor ends up one past the pane's last column
+// after a shrink: its line (with or without a stripped trailing blank
+// before the cursor) now fills the new width exactly. The grid has no
+// such column — positioning there clamps the cursor back ONTO the last
+// cell, and the next character typed overwrites it (the prompt's
+// separating space, or the line's own last character). It must land at
+// column 0 of a continuation row instead, the way a real terminal's
+// pending-wrap state resolves, and rejoin its line on a later widen.
+func TestSetSizeCursorLandingExactlyAtTheNewRightEdgeMovesToAContinuationRow(t *testing.T) {
+	for _, tc := range []struct {
+		name, printed, wantWide string
+	}{
+		{"trailing blank lands in the last cell", "123456789 ", "123456789 ls"},
+		{"content itself fills the row", "1234567890", "1234567890ls"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &fakePty{}
+			origPty := newPty
+			newPty = func(width, height int) (Pty, error) { return p, nil }
+			t.Cleanup(func() { newPty = origPty })
+
+			m := New(1).SetSize(40, 5)
+			m, _ = m.Start()
+			t.Cleanup(func() { _ = m.Close() })
+
+			updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(tc.printed)})
+			m = updated
+			m = m.SetSize(10, 5)
+			updated, _ = m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte("ls")})
+			m = updated
+
+			rows := strings.Split(m.View(), "\n")
+			if got, want := strings.TrimRight(rows[0], " "), strings.TrimRight(tc.printed, " "); got != want {
+				t.Fatalf("got row 0 %q after typing, want %q untouched", got, want)
+			}
+			if got := strings.TrimRight(rows[1], " "); got != "ls" {
+				t.Fatalf("got row 1 %q, want the typed text %q on the continuation row", got, "ls")
+			}
+
+			m = m.SetSize(40, 5)
+			if got := strings.TrimRight(strings.Split(m.View(), "\n")[0], " "); got != tc.wantWide {
+				t.Fatalf("got row 0 %q after widening, want %q rejoined", got, tc.wantWide)
+			}
+		})
 	}
 }
 
