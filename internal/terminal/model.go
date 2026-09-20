@@ -1,6 +1,7 @@
 package terminal
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -15,13 +16,58 @@ import (
 	"cody/internal/scrollbar"
 )
 
-// maxShrinkOverflow caps how many rows Model.shrinkOverflow will ever hold
-// — mirroring the real vt.Emulator's own 10,000-line scrollback cap (see
-// vt.DefaultScrollbackSize), so a long session across many shrink events
-// (e.g. several drags of the pane boundary) can't grow this unboundedly.
-// Oldest entries are dropped first, same eviction order as the library's
-// own scrollback.
-const maxShrinkOverflow = 10000
+// maxHistory caps how many rows Model.history will ever hold — the same
+// 10,000 lines the real vt.Emulator's own scrollback defaults to (see
+// vt.DefaultScrollbackSize), which history now stands in for (see its
+// own doc comment). Oldest entries are dropped first.
+const maxHistory = 10000
+
+// minEmuWidth/minEmuHeight floor the size the emulator and pty are ever
+// actually resized to. A window drag really does pass through sizes
+// where this pane has no room at all (the app floors the pane's size at
+// 0, not 1), and a zero-size grid is where content gets destroyed past
+// any recovery: there is nowhere to write the cursor's row back to, and
+// nothing to capture from on the way back up. Below the floor the
+// emulator simply stays at it, and View clips to the size actually
+// requested.
+const (
+	minEmuWidth  = 1
+	minEmuHeight = 1
+)
+
+// maxReflowTail bounds how many trailing history rows one SetSize call
+// will re-wrap along with the live grid (see pullableTail) — a drag
+// fires dozens of these a second. maxTailLineLookback bounds how much
+// further back it will reach to start that tail on a logical-line
+// boundary rather than mid-line.
+const (
+	maxReflowTail       = 4000
+	maxTailLineLookback = 500
+)
+
+// eraseScrollbackSeq is ED 3, "erase saved lines"; clearScreenSeqs are
+// the ways a shell clears the screen (`clear`, Ctrl+L: home + ED 2, or
+// home + ED 0) — see Update.
+var (
+	eraseScrollbackSeq = []byte("\x1b[3J")
+	clearScreenSeqs    = [][]byte{[]byte("\x1b[2J"), []byte("\x1b[H\x1b[J")}
+)
+
+// historyRowMeta is what reflowing a history row later needs to know
+// about it beyond its text.
+type historyRowMeta struct {
+	// width is the pane width the row was laid out at — what "filled to
+	// the edge" has to be measured against for THIS row (history mixes
+	// rows from many widths) when its successor's continuation isn't
+	// known.
+	width int
+	// continues says the row is a soft-wrap continuation of the row
+	// before it; only meaningful when known (else the successor-of-a-
+	// filled-row heuristic applies, as it does for an untracked live
+	// row). History rows never change once they're here, so a known bit
+	// stays good forever.
+	continues, known bool
+}
 
 // OutputMsg carries a chunk of bytes read from the pty. Exported so
 // internal/app can pass it through to Update unconditionally, the same
@@ -68,19 +114,44 @@ type Model struct {
 	// there is no cursor here for it to track — scrolling the terminal
 	// never moves anything the shell itself is doing, only the viewport.
 	scrollOffset int
-	// shrinkOverflow holds rows evicted by SetSize's unified resize
-	// computation because they no longer fit the new height — oldest
-	// first, rendered as a tier BETWEEN m.emu's own scrollback and the
-	// live screen (see renderScrolledView, ScrollLines): the rows it
-	// holds were on the live screen at capture time, so they are newer
-	// than anything already scrolled into the real scrollback by then,
-	// even though the real scrollback usually holds far more lines
-	// overall (everything that scrolled off before this resize ever
-	// happened). Always an append — SetSize's computation is stateless,
-	// re-deriving fresh from the current grid on every call, so there is
-	// no "continuing the same gesture" concept that would ever call for
-	// a prepend.
-	shrinkOverflow []string
+	// history is everything above the live grid, oldest first — one
+	// chronological list this package owns outright, fed from two
+	// directions: rows a resize pushed out of the live grid because
+	// they no longer fit (writeReflowedRows), and rows real output
+	// scrolled off the top, drained out of the emulator's own
+	// scrollback right after every write (absorbOutput) so the
+	// emulator's scrollback never holds anything between writes.
+	//
+	// One list, because only a single ordered list can be given BACK:
+	// when the pane grows again, the rows a shrink pushed out return to
+	// the live grid (see pullable) — and any output that scrolled off
+	// in between is newer than them and has to come back below them.
+	// While the emulator's scrollback and this package's resize
+	// overflow were separate tiers, that case rendered out of order and
+	// nothing could ever be pulled back at all: shrink the pane to
+	// nothing and restore it, and the content was simply gone from
+	// view, left behind in scrollback wrapped a few columns wide.
+	//
+	// historyMeta is parallel to history (see historyRowMeta).
+	history     []string
+	historyMeta []historyRowMeta
+	// pullable is how many rows at the END of history are owed back to
+	// the live grid when there's room: the rows resizes pushed out,
+	// plus anything that scrolled off after them (it sits between them
+	// and the live grid, so it has to come along). Each SetSize re-wraps
+	// that tail together with the live rows and keeps whatever fits.
+	// Ordinary scrollback — output that scrolled off with no resize
+	// involved — is never pullable: a `clear` followed by a width
+	// change must not drag old output back onto the screen.
+	pullable int
+	// emuW/emuH are the size the emulator and pty are actually at:
+	// width/height floored at minEmuWidth/minEmuHeight (or Start's
+	// 80x24 fallback while never sized). All reflow arithmetic runs on
+	// these; width/height above stay what the caller asked for, and
+	// clipped records that the two differ, so View must cut its output
+	// down to the requested size itself.
+	emuW, emuH int
+	clipped    bool
 	// rowContinues holds, for each of the current live rows (same
 	// indexing as the grid itself, length == m.height when
 	// trustworthy), whether that row is a soft-wrap continuation of
@@ -178,25 +249,30 @@ func (m Model) ID() int {
 // library's own resize did to cell content along the way is fully
 // overwritten regardless of which dimension(s) changed.
 //
-// writeReflowedRows evicts whatever doesn't fit the new height into
-// shrinkOverflow, oldest first, always keeping the NEWEST rows
-// (including whichever holds the cursor) live — see its own doc
-// comment. This one direction now covers a pure width change, a pure
-// height change, and both together, replacing what used to be two
-// separate mechanisms (a height-only capture with its own
-// gesture-tracking flag, and a width-only reflow) that each only
-// protected one dimension and, in the height-only path's case,
-// evicted the wrong end of the grid — a workaround for the library's
-// own resize always keeping the top, which no longer constrains
-// anything once writeReflowedRows unconditionally overwrites the grid
-// afterward regardless.
+// writeReflowedRows pushes whatever doesn't fit the new height out into
+// history, oldest first, always keeping the NEWEST rows (including
+// whichever holds the cursor) live — see its own doc comment. This one
+// direction covers a pure width change, a pure height change, and both
+// together.
 //
-// This runs unconditionally on every resize call, recomputing fresh
-// from the CURRENT grid every time — there is no snapshot to go stale,
-// no "is this still the same gesture" tracking needed, which is what
-// makes a real multi-step drag (many small SetSize calls, one per
-// intermediate size the OS reports) and a single big jump covering the
-// same total resize naturally produce identical results.
+// What a resize pushes out, a later resize gives back: those rows (see
+// pullable) rejoin the computation on every subsequent call, re-wrapped
+// at the new width together with the live rows as the one continuous
+// run of lines they are, and return to the live grid as soon as they
+// fit again. Without that, shrinking the pane far enough and restoring
+// it left the content gone from view for good — stranded in scrollback,
+// wrapped at whatever few columns the pane had passed through.
+//
+// The emulator and pty are never actually sized below
+// minEmuWidth x minEmuHeight (see those constants): below that the
+// requested size is only recorded, and View clips to it.
+//
+// Every resize recomputes fresh from the CURRENT grid plus that tail of
+// history — there is no snapshot to go stale, no "is this still the
+// same gesture" tracking needed, which is what makes a real multi-step
+// drag (many small SetSize calls, one per intermediate size the OS
+// reports) and a single big jump covering the same total resize
+// naturally produce the same result.
 //
 // Skipped entirely while the alt screen (vim, less, ...) is active:
 // Render() would show that app's own UI, not shell history, and
@@ -209,12 +285,23 @@ func (m Model) SetSize(width, height int) Model {
 	if height < 0 {
 		height = 0
 	}
-	changed := width != m.width || height != m.height
-	doResize := changed && m.emu != nil && m.width > 0 && m.height > 0 && !m.emu.IsAltScreen()
+	if width == m.width && height == m.height {
+		return m
+	}
+	m.width, m.height = width, height
+	if m.emu == nil {
+		return m
+	}
+	emuW, emuH := max(width, minEmuWidth), max(height, minEmuHeight)
+	m.clipped = width < emuW || height < emuH
+	if emuW == m.emuW && emuH == m.emuH {
+		return m // only the clip changed — see minEmuWidth
+	}
+	doReflow := !m.emu.IsAltScreen()
 	var newRows []string
 	var newCursorRow, newCursorCol int
 	var newContinues []bool
-	if doResize {
+	if doReflow {
 		oldRows := strings.Split(m.emu.Render(), "\n")
 		cx, cy := m.emu.CursorPosition()
 		// The grid is always full-height, so any rows below the last
@@ -249,22 +336,23 @@ func (m Model) SetSize(width, height int) Model {
 		// reflow.go's design notes). Whenever the record knows row i
 		// continues row i-1, row i-1 was written by this package's own
 		// last reflow at the width recorded in m.rowWrittenWidths[i-1] —
-		// NOT necessarily m.width itself: a continuation row can
-		// legitimately be one column short of m.width when a trailing
+		// NOT necessarily the pane width itself: a continuation row can
+		// legitimately be one column short of it when a trailing
 		// wide (double-width) character cluster didn't fit and
 		// rewrapLogicalLine carried it whole to the next row instead of
 		// splitting it (see rewrapLogicalLine's own doc comment and
 		// TestRewrapLogicalLineNeverSplitsAWideCluster). Comparing against
-		// the RECORDED true width, rather than assuming m.width, is what
-		// tells "the emulator stripped a trailing space" (shortfall vs.
-		// the recorded width) apart from "this row was correctly one
-		// column short already" (no shortfall vs. the recorded width) —
-		// conflating the two would corrupt wide-character content by
-		// padding in a space that was never there.
+		// the RECORDED true width, rather than assuming the pane width,
+		// is what tells "the emulator stripped a trailing space"
+		// (shortfall vs. the recorded width) apart from "this row was
+		// correctly one column short already" (no shortfall vs. the
+		// recorded width) — conflating the two would corrupt
+		// wide-character content by padding in a space that was never
+		// there.
 		known := make([]bool, len(oldRows))
 		for i := 1; i < len(oldRows); i++ {
 			if i >= len(m.rowTracked) || !m.rowTracked[i] {
-				known[i] = isRowFilledToEdge(oldRows[i-1], m.width)
+				known[i] = isRowFilledToEdge(oldRows[i-1], m.emuW)
 				continue
 			}
 			known[i] = m.rowContinues[i]
@@ -275,37 +363,145 @@ func (m Model) SetSize(width, height int) Model {
 				oldRows[i-1] += strings.Repeat(" ", pad)
 			}
 		}
-		if width != m.width {
-			newRows, newCursorRow, newCursorCol, newContinues = reflowRows(oldRows, m.width, width, cy, cx, known)
+		// Row 0's bit is a claim about the last row of history. It only
+		// takes effect when that row is part of this reflow (a non-empty
+		// tail below) — but it's resolved regardless, so a reflow that
+		// doesn't reach back that far still hands it on intact.
+		if len(known) > 0 {
+			if len(m.rowTracked) > 0 && m.rowTracked[0] {
+				known[0] = m.rowContinues[0]
+			} else {
+				known[0] = m.historyContinues(len(m.history))
+			}
+		}
+		// The rows earlier resizes pushed out come back into the
+		// computation (see pullable): re-wrapped at the new width
+		// together with the live rows, as the one continuous run of
+		// lines they are, with writeReflowedRows then keeping whatever
+		// fits the new height live and pushing the rest back out.
+		//
+		// A width change re-wraps everything owed back (up to
+		// maxReflowTail); a height-only change can't use more than
+		// roughly a screenful of it, and re-wrapping rows at an
+		// unchanged width just reproduces them — dragging the pane's
+		// top edge shouldn't cost thousands of rows a step.
+		tailLimit := maxReflowTail
+		if emuW == m.emuW {
+			tailLimit = min(tailLimit, 2*emuH)
+		}
+		tail, tailKnown, tailStart := m.pullableTail(tailLimit)
+		if emuW != m.emuW || len(tail) > 0 {
+			rows := append(append([]string{}, tail...), oldRows...)
+			rowsKnown := append(append([]bool{}, tailKnown...), known...)
+			newRows, newCursorRow, newCursorCol, newContinues = reflowRows(rows, m.emuW, emuW, cy+len(tail), cx, rowsKnown)
+			if len(tail) == 0 && len(newContinues) > 0 {
+				newContinues[0] = known[0]
+			}
 		} else {
-			// Width didn't change — nothing to rewrap. The old rows,
-			// cursor position, and resolved continuation bits all pass
-			// through unchanged; writeReflowedRows below still handles
-			// a height change on its own (evicting excess into
-			// shrinkOverflow if the new height is smaller).
+			// Width didn't change and nothing is owed back — nothing to
+			// rewrap. The old rows, cursor position, and resolved
+			// continuation bits all pass through unchanged;
+			// writeReflowedRows below still handles a height change on
+			// its own (pushing excess into history if the new height is
+			// smaller).
 			newRows, newCursorRow, newCursorCol = oldRows, cy, cx
 			newContinues = known
 		}
-	} else if changed {
+		if removed := len(m.history) - tailStart; removed > 0 {
+			m = m.alignHistoryMeta()
+			m.history, m.historyMeta = m.history[:tailStart], m.historyMeta[:tailStart]
+			m.pullable = max(0, m.pullable-removed)
+			// A paused viewport is measured back from the live tail,
+			// which these rows just rejoined; writeReflowedRows adds
+			// back whatever it pushes out again. Never all the way to 0
+			// here — that would silently un-pause it mid-computation.
+			if m.scrollOffset > 0 {
+				m.scrollOffset = max(1, m.scrollOffset-removed)
+			}
+		}
+	} else {
 		// The grid is about to be resized with no reflow of its own
-		// (alt screen up, or a degenerate zero size on either end) —
-		// whatever the record says about row positions can't be trusted
-		// to line up with it afterward.
+		// (alt screen up) — whatever the record says about row
+		// positions can't be trusted to line up with it afterward.
 		m.rowContinues, m.rowWrittenWidths, m.rowTracked = nil, nil, nil
 	}
-	m.width, m.height = width, height
-	if changed {
-		if m.pty != nil {
-			m.pty.Resize(width, height)
-		}
-		if m.emu != nil {
-			m.emu.Resize(width, height)
-		}
+	if m.pty != nil {
+		m.pty.Resize(emuW, emuH)
 	}
-	if doResize {
-		m = m.writeReflowedRows(newRows, newCursorRow, newCursorCol, height, newContinues)
+	m.emu.Resize(emuW, emuH)
+	m.emuW, m.emuH = emuW, emuH
+	if doReflow {
+		m = m.writeReflowedRows(newRows, newCursorRow, newCursorCol, emuH, newContinues)
 	}
 	return m
+}
+
+// historyContinues reports whether history row h is a soft-wrap
+// continuation of row h-1: the known bit if there is one, otherwise the
+// filled-to-the-edge heuristic against row h-1 at the width IT was laid
+// out at. h == len(m.history) asks the same question about whatever
+// follows history's last row (the live grid's first row).
+func (m Model) historyContinues(h int) bool {
+	if h <= 0 || h > len(m.history) {
+		return false
+	}
+	if h < len(m.historyMeta) && m.historyMeta[h].known {
+		return m.historyMeta[h].continues
+	}
+	if h-1 < len(m.historyMeta) && m.historyMeta[h-1].width > 0 {
+		return isRowFilledToEdge(m.history[h-1], m.historyMeta[h-1].width)
+	}
+	return false
+}
+
+// pullableTail returns the trailing history rows this resize re-wraps
+// along with the live grid (see pullable), their resolved continuation
+// bits, and the history index they start at (len(m.history) if there
+// are none). Capped at limit rows, then extended back — by at
+// most maxTailLineLookback more — to start on a logical-line boundary:
+// starting mid-line would re-wrap the tail end of a line as if it were
+// a whole one and leave its head behind at the old width.
+func (m Model) pullableTail(limit int) (rows []string, continues []bool, start int) {
+	n := min(m.pullable, len(m.history), limit)
+	if n <= 0 {
+		return nil, nil, len(m.history)
+	}
+	start = len(m.history) - n
+	for back := 0; start > 0 && back < maxTailLineLookback && m.historyContinues(start); back++ {
+		start--
+	}
+	rows = m.history[start:]
+	continues = make([]bool, len(rows))
+	for i := 1; i < len(rows); i++ {
+		continues[i] = m.historyContinues(start + i)
+	}
+	return rows, continues, start
+}
+
+// alignHistoryMeta pads historyMeta out to history's length with
+// zero-value (unknown) entries, so the two can be sliced and appended
+// in lockstep from here on regardless of how history was populated.
+func (m Model) alignHistoryMeta() Model {
+	for len(m.historyMeta) < len(m.history) {
+		m.historyMeta = append(m.historyMeta, historyRowMeta{})
+	}
+	m.historyMeta = m.historyMeta[:len(m.history)]
+	return m
+}
+
+// pushHistory appends rows (with their meta) to history, dropping the
+// oldest rows past maxHistory, and reports how many rows history
+// actually grew by.
+func (m Model) pushHistory(rows []string, meta []historyRowMeta) (Model, int) {
+	m = m.alignHistoryMeta()
+	before := len(m.history)
+	m.history = append(m.history, rows...)
+	m.historyMeta = append(m.historyMeta, meta...)
+	if over := len(m.history) - maxHistory; over > 0 {
+		m.history, m.historyMeta = m.history[over:], m.historyMeta[over:]
+		before -= over
+	}
+	return m, len(m.history) - max(before, 0)
 }
 
 // writeReflowedRows writes newRows (already computed at the new width
@@ -318,16 +514,16 @@ func (m Model) SetSize(width, height int) Model {
 // anything already there is stale by construction and writing over it
 // without erasing leaves the old, longer content showing through (see
 // the row loops' own comments). Rows beyond newHeight are appended into
-// m.shrinkOverflow (see its own doc comment) rather than discarded,
+// m.history (see its own doc comment) rather than discarded,
 // mirroring how a real terminal pushes reflow overflow into scrollback:
 // this is always an append, never a prepend, since reflow has no
 // "continuing the same gesture" concept (see reflowRows' own doc
 // comment) — every call's overflow is, by construction, a fresh batch
-// relative to whatever shrinkOverflow already holds.
+// relative to whatever history already holds.
 //
 // newContinues carries the known-continuation bits for newRows (see
 // reflowRows' own doc comment) — shifted/trimmed here in lockstep with
-// newRows whenever excess rows get evicted into shrinkOverflow, then
+// newRows whenever excess rows get evicted into history, then
 // stored as the new m.rowContinues (padded with false for any row from
 // len(newRows) through newHeight-1, since blank padding is never a
 // continuation of anything). This is what lets the NEXT SetSize call
@@ -341,21 +537,25 @@ func (m Model) SetSize(width, height int) Model {
 // m.width, must be what SetSize compares against later.
 func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, newHeight int, newContinues []bool) Model {
 	if excess := len(newRows) - newHeight; excess > 0 {
-		beforeOverflowLen := len(m.shrinkOverflow)
-		m.shrinkOverflow = append(m.shrinkOverflow, newRows[:excess]...)
-		if over := len(m.shrinkOverflow) - maxShrinkOverflow; over > 0 {
-			m.shrinkOverflow = m.shrinkOverflow[over:]
+		meta := make([]historyRowMeta, excess)
+		for i := range meta {
+			meta[i] = historyRowMeta{width: m.emuW, continues: i < len(newContinues) && newContinues[i], known: true}
 		}
+		var grew int
+		m, grew = m.pushHistory(newRows[:excess], meta)
+		// Everything a resize pushes out is owed back when there's
+		// room again — see pullable.
+		m.pullable = min(m.pullable+excess, len(m.history))
 		// Pin a paused viewport the same way Update's OutputMsg case
 		// already does when real output grows the combined buffer
-		// underneath it: the combined buffer (scrollback + shrinkOverflow
-		// + live) just grew by however much of this batch actually stuck
-		// (after the maxShrinkOverflow trim above may have dropped some
-		// of it from the front), so scrollOffset must grow by the same
-		// amount, or renderScrolledView's paused viewport silently drifts
-		// toward the live tail even though the user never asked it to.
+		// underneath it: the combined buffer (history + live) just grew
+		// by however much of this batch actually stuck (after the
+		// maxHistory trim may have dropped some of it from the front),
+		// so scrollOffset must grow by the same amount, or
+		// renderScrolledView's paused viewport silently drifts toward
+		// the live tail even though the user never asked it to.
 		if m.scrollOffset > 0 {
-			m.scrollOffset += len(m.shrinkOverflow) - beforeOverflowLen
+			m.scrollOffset += grew
 		}
 		newRows = newRows[excess:]
 		if excess <= len(newContinues) {
@@ -372,10 +572,10 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 		newCursorRow = newHeight - 1
 	}
 	// cursorAfterRewrap keeps a cursor's columns past the end of its
-	// row's rendered content (see its own doc comment) — m.width is
+	// row's rendered content (see its own doc comment) — m.emuW is
 	// already the new width by the time this runs.
-	if m.width > 0 && newCursorCol >= m.width {
-		newCursorCol = m.width - 1
+	if m.emuW > 0 && newCursorCol >= m.emuW {
+		newCursorCol = m.emuW - 1
 	}
 	var buf strings.Builder
 	for i, row := range newRows {
@@ -433,20 +633,25 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 	return m
 }
 
-// retrackRowsAfterOutput carries the tracked wrap record (rowContinues/
-// rowWrittenWidths/rowTracked) across a write of real output, keeping it
-// only for rows that write left alone. beforeRows/beforeScrollbackLen
-// are the live grid's rendered rows and the scrollback length captured
-// immediately before the write; nil beforeRows means "nothing was
-// captured" and drops the record outright.
+// absorbOutput runs right after a write of real output: it drains
+// whatever that write scrolled into the emulator's scrollback over into
+// history (see history's own doc comment — the emulator's scrollback
+// never holds anything between writes), and carries the tracked wrap
+// record (rowContinues/rowWrittenWidths/rowTracked) across the write,
+// keeping it only for what the write left alone. beforeRows and
+// beforeScrollbackLen are the live grid's rendered rows and the
+// scrollback length captured immediately before the write; nil
+// beforeRows means "nothing was captured" and drops the record. It
+// reports how many rows the write scrolled off the top.
 //
 // This package has no visibility into what arbitrary output did to the
-// grid, so "left alone" is judged purely from the outside. Row i's bit
-// records whether the row ABOVE it wrapped into it — the same thing a
-// real terminal stores as a "wrapped" flag on row i-1 — so it stays
-// tracked iff row i-1's rendered string is identical to the row it came
-// from: the row at the same index, shifted by however many lines the
-// write scrolled into scrollback. Row i's own content changing doesn't
+// grid, so "left alone" is judged purely from the outside. Lining the
+// rows up is simple: the rows this write scrolled off, followed by the
+// live grid after it, is the same run of rows as the grid before it,
+// index for index. Row x's bit records whether the row ABOVE it wrapped
+// into it — the same thing a real terminal stores as a "wrapped" flag
+// on row x-1 — so it stays tracked iff row x-1's rendered string is
+// identical before and after. Row x's own content changing doesn't
 // matter, exactly as it doesn't to a real terminal's flag: typing at a
 // prompt that sits under a full-width row mustn't hand that boundary
 // back to the heuristic, which would false-join the two. A row above
@@ -455,66 +660,87 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 // heuristic — all any row had before this record existed. One rewritten
 // with byte-identical content (the usual result of a shell redrawing
 // its prompt on SIGWINCH) keeps its state, correctly: the same content
-// in the same place wraps the same way. rowWrittenWidths[i] is only
-// ever consulted through a tracked bit i+1, which this rule already
-// ties to row i being unchanged.
+// in the same place wraps the same way. rowWrittenWidths[x] is only
+// ever consulted through a tracked bit x+1, which this rule already
+// ties to row x being unchanged.
 //
-// The scroll shift is read off the scrollback's growth — exact until
-// the library's scrollback reaches its cap, where every line pushed in
-// evicts one from the other end and growth under-reports the shift (or
-// reads 0). Rows compared at the wrong offset mostly just fail to match,
-// but repeated identical rows could match and inherit an unrelated
-// row's state. The eviction itself is the tell: below the cap the
-// OLDEST scrollback line (beforeOldestScrollback, captured alongside
-// beforeRows) never changes, so if it did, the shift is unknowable and
-// the record is dropped. A write that doesn't scroll — the SIGWINCH
-// prompt redraw this all exists for — is unaffected at any scrollback
-// size. (Evicted lines textually identical to their successors slip
-// past this check; what's left is then the same bounded, heuristic-
-// class misjudgment described above, needing a second coincidence on
-// top.) A shrinking scrollback (cleared) or the alt screen coming up
-// drops the record outright too.
-func (m Model) retrackRowsAfterOutput(beforeRows []string, beforeScrollbackLen int, beforeOldestScrollback string) Model {
-	if m.rowTracked == nil {
-		return m
+// A row that scrolls off takes its state into history with it: its
+// continuation bit as a known one, and — since it's drained as a
+// RENDERED string, trailing blanks stripped — the blank a tracked wrap
+// boundary ended on put back, exactly as SetSize does for live rows.
+// Without that, a wrapped line scrolling off mid-drag would come back
+// from history with the words either side of the wrap fused.
+//
+// (Because the scrollback is drained after every write, it never
+// reaches the library's own cap, where its growth would stop being an
+// exact count of what scrolled.) A shrinking scrollback (cleared) or
+// the alt screen coming up drops the record outright.
+func (m Model) absorbOutput(beforeRows []string, beforeScrollbackLen int) (Model, int) {
+	total := m.emu.ScrollbackLen()
+	scrolled := total - beforeScrollbackLen
+	drained := make([]string, total)
+	meta := make([]historyRowMeta, total)
+	for i := range drained {
+		drained[i] = m.emu.ScrollbackLine(i)
+		meta[i].width = m.emuW
 	}
-	shift := m.emu.ScrollbackLen() - beforeScrollbackLen
-	evicted := beforeScrollbackLen > 0 && m.emu.ScrollbackLine(0) != beforeOldestScrollback
-	if beforeRows == nil || shift < 0 || evicted || m.emu.IsAltScreen() {
-		m.rowContinues, m.rowWrittenWidths, m.rowTracked = nil, nil, nil
-		return m
+	if total > 0 {
+		m.emu.ClearScrollback()
 	}
-	afterRows := strings.Split(m.emu.Render(), "\n")
-	n := len(m.rowTracked)
-	unchanged := func(i int) bool {
-		j := i + shift
-		return i < len(afterRows) && j < len(beforeRows) && afterRows[i] == beforeRows[j]
-	}
-	continues := make([]bool, n)
-	widths := make([]int, n)
-	tracked := make([]bool, n)
+
+	var continues, tracked []bool
+	var widths []int
 	worthKeeping := false
-	for i := range n {
-		j := i + shift
-		if j >= n {
-			break // scrolled in fresh at the bottom: nothing recorded
+	if m.rowTracked != nil && beforeRows != nil && scrolled >= 0 && scrolled <= total && !m.emu.IsAltScreen() {
+		afterRows := strings.Split(m.emu.Render(), "\n")
+		after := append(append([]string{}, drained[total-scrolled:]...), afterRows...)
+		n := len(m.rowTracked)
+		unchanged := func(x int) bool {
+			return x < len(after) && x < len(beforeRows) && after[x] == beforeRows[x]
 		}
-		continues[i] = m.rowContinues[j]
-		widths[i] = m.rowWrittenWidths[j]
-		tracked[i] = m.rowTracked[j] && (i == 0 || unchanged(i-1))
-		// A blank row above tracks trivially (nothing wraps out of
-		// it); a record holding nothing else isn't worth a
-		// before/after render on every future write.
-		if tracked[i] && i > 0 && strings.TrimSpace(afterRows[i-1]) != "" {
-			worthKeeping = true
+		bitTracked := func(x int) bool {
+			return x < n && m.rowTracked[x] && (x == 0 || unchanged(x-1))
+		}
+		for x := 0; x < scrolled; x++ {
+			d := total - scrolled + x
+			if bitTracked(x) {
+				meta[d].known, meta[d].continues = true, m.rowContinues[x]
+			}
+			if bitTracked(x+1) && m.rowContinues[x+1] {
+				if pad := m.rowWrittenWidths[x] - ansi.StringWidth(drained[d]); pad > 0 {
+					drained[d] += strings.Repeat(" ", pad)
+				}
+			}
+		}
+		continues, widths, tracked = make([]bool, n), make([]int, n), make([]bool, n)
+		for i := range n {
+			x := i + scrolled
+			if x >= n {
+				break // scrolled in fresh at the bottom: nothing recorded
+			}
+			continues[i], widths[i], tracked[i] = m.rowContinues[x], m.rowWrittenWidths[x], bitTracked(x)
+			// A blank row above tracks trivially (nothing wraps out of
+			// it); a record holding nothing else isn't worth a
+			// before/after render on every future write.
+			if tracked[i] && ((i > 0 && strings.TrimSpace(afterRows[i-1]) != "") || (i == 0 && continues[i])) {
+				worthKeeping = true
+			}
 		}
 	}
-	if !worthKeeping {
+	if worthKeeping {
+		m.rowContinues, m.rowWrittenWidths, m.rowTracked = continues, widths, tracked
+	} else {
 		m.rowContinues, m.rowWrittenWidths, m.rowTracked = nil, nil, nil
-		return m
 	}
-	m.rowContinues, m.rowWrittenWidths, m.rowTracked = continues, widths, tracked
-	return m
+
+	var grew int
+	m, grew = m.pushHistory(drained, meta)
+	if m.pullable > 0 {
+		// Newer than the rows a resize pushed out, and sitting between
+		// them and the live grid: it comes back with them (see pullable).
+		m.pullable = min(m.pullable+grew, len(m.history))
+	}
+	return m, max(scrolled, 0)
 }
 
 func (m Model) Started() bool {
@@ -539,7 +765,7 @@ func (m Model) ScrollLines(n int) Model {
 		return m
 	}
 	m.scrollOffset -= n
-	if maxOffset := m.emu.ScrollbackLen() + len(m.shrinkOverflow); m.scrollOffset > maxOffset {
+	if maxOffset := m.emu.ScrollbackLen() + len(m.history); m.scrollOffset > maxOffset {
 		m.scrollOffset = maxOffset
 	}
 	if m.scrollOffset < 0 {
@@ -588,6 +814,7 @@ func (m Model) Start() (Model, tea.Cmd) {
 
 	m.pty = p
 	m.emu = newEmulator(w, h)
+	m.emuW, m.emuH = w, h
 	m.generation++
 	return m, readCmd(m.pty, m.id, m.generation)
 }
@@ -625,13 +852,30 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		// preserve — a session that has never been resized (or whose
 		// record has fully aged out) pays nothing extra per write.
 		var beforeRows []string
-		var beforeOldest string
 		if m.rowTracked != nil && !wasAltScreen {
 			beforeRows = strings.Split(m.emu.Render(), "\n")
-			beforeOldest = m.emu.ScrollbackLine(0)
 		}
 		m.emu.Write(msg.data)
-		m = m.retrackRowsAfterOutput(beforeRows, beforeLen, beforeOldest)
+		if bytes.Contains(msg.data, eraseScrollbackSeq) {
+			// ED 3 erases the emulator's scrollback — which lives in
+			// history now (see its doc comment), so honoring the
+			// sequence is this package's job. Whatever this same write
+			// scrolled off AFTER the erase is still in the emulator's
+			// scrollback for absorbOutput to pick up below.
+			m.history, m.historyMeta, m.pullable = nil, nil, 0
+			m.scrollOffset = 0
+		}
+		for _, seq := range clearScreenSeqs {
+			if bytes.Contains(msg.data, seq) {
+				// The user cleared the screen: whatever earlier resizes
+				// pushed out is just scrollback now, not something a
+				// later resize should put back in front of them.
+				m.pullable = 0
+				break
+			}
+		}
+		var scrolled int
+		m, scrolled = m.absorbOutput(beforeRows, beforeLen)
 		switch {
 		case wasAltScreen && !m.emu.IsAltScreen():
 			// The alt screen (vim, less, ...) just exited as part of this
@@ -643,7 +887,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			// stale scrollback into that prompt.
 			m.scrollOffset = 0
 		case m.scrollOffset > 0:
-			m.scrollOffset += m.emu.ScrollbackLen() - beforeLen
+			m.scrollOffset += scrolled
 		}
 		return m, readCmd(m.pty, m.id, m.generation)
 	case ReadErrMsg:
@@ -689,6 +933,12 @@ func (m Model) View() string {
 	// sitting >0 from before the app started (ScrollLines resets it back
 	// to 0 on the next scroll attempt, but View() can't wait for that —
 	// it must render correctly on the very next frame regardless).
+	if m.clipped {
+		// The emulator is never sized below minEmuWidth x minEmuHeight,
+		// so the only requested sizes it can be bigger than are ones
+		// with no room to show anything at all.
+		return ""
+	}
 	if m.scrollOffset == 0 || m.emu.IsAltScreen() {
 		return m.emu.Render()
 	}
@@ -711,21 +961,17 @@ var scrollbarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 //
 // The vt library's Render() only ever renders the live screen — there is
 // no "render at an offset" parameter — so a paused/scrolled view is built
-// by hand from three chronologically-ordered tiers, oldest first: the
-// emulator's own scrollback (ScrollbackLen/ScrollbackLine — normally far
-// more content than a single shrink ever captures, everything that
-// scrolled off before the shrink happened), then m.shrinkOverflow (rows a
-// resize would otherwise have destroyed — either a height shrink, see
-// SetSize, or a width-only reflow needing more rows than the current
-// height holds, see writeReflowedRows — which were still on the live
-// screen at capture time, making them newer than whatever was already in
-// scrollback then), then the live screen's own rows. The live screen's
+// by hand, oldest first: m.history (everything above the live grid — see
+// its own doc comment), then the live screen's own rows. The emulator's
+// own scrollback is read first, ahead of history, purely for
+// completeness: Update drains it into history after every write, so in
+// a running session it is always empty here. The live screen's
 // individual rows come from splitting Render()'s own output on "\n" —
 // safe because ANSI SGR/CSI escape sequences never contain a raw
 // newline byte.
 func (m Model) renderScrolledView() string {
 	liveLines := strings.Split(m.emu.Render(), "\n")
-	overflowLen := len(m.shrinkOverflow)
+	overflowLen := len(m.history)
 	sbLen := m.emu.ScrollbackLen()
 	height := m.height
 	if height <= 0 || height > len(liveLines) {
@@ -741,18 +987,11 @@ func (m Model) renderScrolledView() string {
 		var line string
 		switch {
 		case i < sbLen:
-			// Real scrollback comes first (oldest): it holds everything
-			// that scrolled off before this shrink ever happened, which
-			// is normally far more content than a single shrink captures.
+			// Anything still in the emulator's own scrollback — normally
+			// nothing (see this function's doc comment).
 			line = m.emu.ScrollbackLine(i)
 		case i-sbLen < overflowLen:
-			// shrinkOverflow sits between scrollback and the live screen
-			// — its rows were still on the live screen at capture time,
-			// so they're newer than anything already in scrollback then
-			// (see shrinkOverflow's own doc comment for the one edge
-			// case this doesn't perfectly handle: real output arriving
-			// AFTER a shrink and being pushed into scrollback afterward).
-			line = m.shrinkOverflow[i-sbLen]
+			line = m.history[i-sbLen]
 		case i-sbLen-overflowLen < len(liveLines):
 			line = liveLines[i-sbLen-overflowLen]
 		}

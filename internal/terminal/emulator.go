@@ -23,6 +23,10 @@ type Emulator interface {
 	// scrollback line at index (0 = oldest), or "" if index is out of
 	// range.
 	ScrollbackLine(index int) string
+	// ClearScrollback empties the scrollback buffer. Model drains it into
+	// its own history after every write (see Model.history), so between
+	// writes it never holds anything.
+	ClearScrollback()
 	// IsAltScreen reports whether the terminal is currently showing its
 	// alternate screen (full-screen apps like vim/htop/less switch to
 	// this while running). The alt screen doesn't use the main screen's
@@ -61,6 +65,10 @@ func (e vtEmulator) ScrollbackLine(index int) string {
 		return ""
 	}
 	return line.Render()
+}
+
+func (e vtEmulator) ClearScrollback() {
+	e.Emulator.Scrollback().Clear()
 }
 
 func (e vtEmulator) CursorPosition() (x, y int) {

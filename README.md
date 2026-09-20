@@ -198,8 +198,15 @@ send the matching escape sequence.
   ends on a blank cell (common in prose, where the wrap point often
   lands just after a space) measures narrower than the full width and is
   never rejoined on a later widen. Both are known limitations of working
-  from rendered rows rather than raw terminal cells. Content that scrolls
-  off the pane's visible area (from a height shrink or from reflow
-  running out of room) is also never re-wrapped again by a later resize
-  — it stays wrapped at whatever width it was at when it scrolled off,
-  same as real terminal scrollback.
+  from rendered rows rather than raw terminal cells.
+- Rows a resize pushes out of the terminal pane come back, re-wrapped, when
+  the pane grows again — shrinking the window all the way down and
+  restoring it puts the content back where it was. Ordinary scrollback
+  (output that scrolled off on its own) is only re-wrapped by a width change
+  when it sits below rows a resize pushed out, and only its most recent few
+  thousand lines; older scrollback stays wrapped at the width it scrolled
+  off at. Clearing the screen (`clear`, `Ctrl+L`) cancels the give-back:
+  after it, a resize never drags old output back into view.
+- Resizing while a full-screen program (`vim`, `less`, ...) is open does not
+  reflow the shell output underneath it; lines wider than the narrowest
+  size reached come back truncated once the program exits.
