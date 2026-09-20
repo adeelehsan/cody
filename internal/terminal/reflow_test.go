@@ -457,3 +457,17 @@ func TestReflowRowsConsumesAKnownOverride(t *testing.T) {
 		t.Fatalf("got newRows=%q, want a single joined row %q — known override was not consumed", newRows, []string{"shortnext"})
 	}
 }
+
+// TestReflowRowsKeepsCursorPastStrippedTrailingBlanks: the emulator
+// strips trailing blank cells from a rendered row, so a prompt like
+// "$ " arrives here as "$" with the cursor at column 2 — one past the
+// rendered content. The cursor must stay at column 2, not slide back to
+// the content's end: whatever gets typed next would otherwise land
+// glued onto the prompt ("$ls").
+func TestReflowRowsKeepsCursorPastStrippedTrailingBlanks(t *testing.T) {
+	rows := []string{"some output", "$"}
+	_, newRow, newCol, _ := reflowRows(rows, 40, 20, 1, 2, nil)
+	if newRow != 1 || newCol != 2 {
+		t.Fatalf("got cursor (%d,%d), want (1,2) — the column past the prompt's stripped trailing space", newRow, newCol)
+	}
+}

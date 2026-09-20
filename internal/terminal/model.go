@@ -87,10 +87,11 @@ type Model struct {
 	// the row above it — as determined with certainty by this
 	// package's own last reflow, not guessed from rendered text. nil
 	// means "no trustworthy record for the current grid" (nothing has
-	// been reflowed yet, or real output arrived and invalidated it) —
-	// every consumer must treat nil exactly like "fall back to
-	// isRowFilledToEdge's heuristic," so this can never make behavior
-	// worse than before this field existed, only better. See the
+	// been reflowed yet, or real output has since rewritten everything
+	// it covered) — every consumer must treat nil exactly like "fall
+	// back to isRowFilledToEdge's heuristic," so this can never make
+	// behavior worse than before this field existed, only better. An
+	// entry only counts while rowTracked says so (see below). See the
 	// design spec at docs/superpowers/specs/2026-09-11-reflow-continuation-tracking-design.md.
 	rowContinues []bool
 	// rowWrittenWidths holds, for each of the current live rows (same
@@ -106,6 +107,20 @@ type Model struct {
 	// column short" — conflating the two corrupts wide-character content
 	// by inserting a space that was never there.
 	rowWrittenWidths []int
+	// rowTracked says which entries of rowContinues/rowWrittenWidths are
+	// still trustworthy (same indexing and length; all three are nil
+	// together). writeReflowedRows marks every row tracked; real output
+	// then un-tracks only the rows it actually changed (see
+	// retrackRowsAfterOutput) rather than discarding the whole record.
+	// That distinction is what lets the record survive a real drag at
+	// all: every pty resize delivers SIGWINCH, and an interactive shell
+	// answers each one by redrawing its prompt — output that arrives
+	// between EVERY pair of SetSize calls, but only ever rewrites the
+	// prompt's own rows. An untracked row falls back to the
+	// isRowFilledToEdge heuristic, exactly like a nil record does for
+	// every row. See
+	// docs/superpowers/specs/2026-09-20-reflow-tracking-survives-output-design.md.
+	rowTracked []bool
 }
 
 // New creates a terminal session identified by id — a value the caller
@@ -217,30 +232,43 @@ func (m Model) SetSize(width, height int) Model {
 		if lastMeaningful+1 < len(oldRows) {
 			oldRows = oldRows[:lastMeaningful+1]
 		}
+		// Resolve "does row i continue row i-1" for every captured row:
+		// the tracked record wins wherever it's still trustworthy (see
+		// rowTracked), the isRowFilledToEdge heuristic covers every other
+		// row — fresh output, or rows real output has rewritten since the
+		// last reflow. Resolved here rather than inside reflowRows so the
+		// pass-through branch below stores the same answer: handing
+		// writeReflowedRows a nil/partial record there would have it
+		// record "not a continuation" as certain for rows nobody ever
+		// looked at, and the next width change would then refuse to
+		// rejoin a genuinely wrapped line.
+		//
 		// The real vt.Emulator strips trailing blank cells when it
 		// renders a row back to a string — indistinguishable, cell by
 		// cell, from a row that just never reached the edge (see
-		// reflow.go's design notes). Whenever m.rowContinues already
-		// knows row i continues row i-1, row i-1 was written by this
-		// package's own last reflow at the width recorded in
-		// m.rowWrittenWidths[i-1] — NOT necessarily m.width itself: a
-		// continuation row can legitimately be one column short of
-		// m.width when a trailing wide (double-width) character
-		// cluster didn't fit and rewrapLogicalLine carried it whole to
-		// the next row instead of splitting it (see rewrapLogicalLine's
-		// own doc comment and TestRewrapLogicalLineNeverSplitsAWideCluster).
-		// Comparing against the RECORDED true width, rather than
-		// assuming m.width, is what tells "the emulator stripped a
-		// trailing space" (shortfall vs. the recorded width) apart from
-		// "this row was correctly one column short already" (no
-		// shortfall vs. the recorded width) — conflating the two would
-		// corrupt wide-character content by padding in a space that was
-		// never there.
-		for i := 1; i < len(oldRows) && i < len(m.rowContinues); i++ {
-			if !m.rowContinues[i] {
+		// reflow.go's design notes). Whenever the record knows row i
+		// continues row i-1, row i-1 was written by this package's own
+		// last reflow at the width recorded in m.rowWrittenWidths[i-1] —
+		// NOT necessarily m.width itself: a continuation row can
+		// legitimately be one column short of m.width when a trailing
+		// wide (double-width) character cluster didn't fit and
+		// rewrapLogicalLine carried it whole to the next row instead of
+		// splitting it (see rewrapLogicalLine's own doc comment and
+		// TestRewrapLogicalLineNeverSplitsAWideCluster). Comparing against
+		// the RECORDED true width, rather than assuming m.width, is what
+		// tells "the emulator stripped a trailing space" (shortfall vs.
+		// the recorded width) apart from "this row was correctly one
+		// column short already" (no shortfall vs. the recorded width) —
+		// conflating the two would corrupt wide-character content by
+		// padding in a space that was never there.
+		known := make([]bool, len(oldRows))
+		for i := 1; i < len(oldRows); i++ {
+			if i >= len(m.rowTracked) || !m.rowTracked[i] {
+				known[i] = isRowFilledToEdge(oldRows[i-1], m.width)
 				continue
 			}
-			if i-1 >= len(m.rowWrittenWidths) {
+			known[i] = m.rowContinues[i]
+			if !known[i] {
 				continue
 			}
 			if pad := m.rowWrittenWidths[i-1] - ansi.StringWidth(oldRows[i-1]); pad > 0 {
@@ -248,16 +276,22 @@ func (m Model) SetSize(width, height int) Model {
 			}
 		}
 		if width != m.width {
-			newRows, newCursorRow, newCursorCol, newContinues = reflowRows(oldRows, m.width, width, cy, cx, m.rowContinues)
+			newRows, newCursorRow, newCursorCol, newContinues = reflowRows(oldRows, m.width, width, cy, cx, known)
 		} else {
 			// Width didn't change — nothing to rewrap. The old rows,
-			// cursor position, and known continuation bits all pass
+			// cursor position, and resolved continuation bits all pass
 			// through unchanged; writeReflowedRows below still handles
 			// a height change on its own (evicting excess into
 			// shrinkOverflow if the new height is smaller).
 			newRows, newCursorRow, newCursorCol = oldRows, cy, cx
-			newContinues = m.rowContinues
+			newContinues = known
 		}
+	} else if changed {
+		// The grid is about to be resized with no reflow of its own
+		// (alt screen up, or a degenerate zero size on either end) —
+		// whatever the record says about row positions can't be trusted
+		// to line up with it afterward.
+		m.rowContinues, m.rowWrittenWidths, m.rowTracked = nil, nil, nil
 	}
 	m.width, m.height = width, height
 	if changed {
@@ -337,6 +371,12 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 	if newHeight > 0 && newCursorRow >= newHeight {
 		newCursorRow = newHeight - 1
 	}
+	// cursorAfterRewrap keeps a cursor's columns past the end of its
+	// row's rendered content (see its own doc comment) — m.width is
+	// already the new width by the time this runs.
+	if m.width > 0 && newCursorCol >= m.width {
+		newCursorCol = m.width - 1
+	}
 	var buf strings.Builder
 	for i, row := range newRows {
 		if i >= newHeight {
@@ -385,7 +425,84 @@ func (m Model) writeReflowedRows(newRows []string, newCursorRow, newCursorCol, n
 		}
 		m.rowWrittenWidths[i] = ansi.StringWidth(row)
 	}
+	m.rowTracked = make([]bool, newHeight)
+	for i := range m.rowTracked {
+		m.rowTracked[i] = true
+	}
 	m.emu.Write([]byte(buf.String()))
+	return m
+}
+
+// retrackRowsAfterOutput carries the tracked wrap record (rowContinues/
+// rowWrittenWidths/rowTracked) across a write of real output, keeping it
+// only for rows that write left alone. beforeRows/beforeScrollbackLen
+// are the live grid's rendered rows and the scrollback length captured
+// immediately before the write; nil beforeRows means "nothing was
+// captured" and drops the record outright.
+//
+// This package has no visibility into what arbitrary output did to the
+// grid, so "left alone" is judged purely from the outside. Row i's bit
+// records whether the row ABOVE it wrapped into it — the same thing a
+// real terminal stores as a "wrapped" flag on row i-1 — so it stays
+// tracked iff row i-1's rendered string is identical to the row it came
+// from: the row at the same index, shifted by however many lines the
+// write scrolled into scrollback. Row i's own content changing doesn't
+// matter, exactly as it doesn't to a real terminal's flag: typing at a
+// prompt that sits under a full-width row mustn't hand that boundary
+// back to the heuristic, which would false-join the two. A row above
+// that was rewritten, appended to, cleared, or moved by a scroll region
+// or reverse index simply stops matching and falls back to the
+// heuristic — all any row had before this record existed. One rewritten
+// with byte-identical content (the usual result of a shell redrawing
+// its prompt on SIGWINCH) keeps its state, correctly: the same content
+// in the same place wraps the same way. rowWrittenWidths[i] is only
+// ever consulted through a tracked bit i+1, which this rule already
+// ties to row i being unchanged.
+//
+// The scroll shift is read off the scrollback's growth. Once the
+// library's scrollback is at its cap it stops growing, the shift reads
+// as 0, and scrolled rows just fail to match — conservative, not wrong.
+// A shrinking scrollback (cleared) or the alt screen coming up drops
+// the record outright.
+func (m Model) retrackRowsAfterOutput(beforeRows []string, beforeScrollbackLen int) Model {
+	if m.rowTracked == nil {
+		return m
+	}
+	shift := m.emu.ScrollbackLen() - beforeScrollbackLen
+	if beforeRows == nil || shift < 0 || m.emu.IsAltScreen() {
+		m.rowContinues, m.rowWrittenWidths, m.rowTracked = nil, nil, nil
+		return m
+	}
+	afterRows := strings.Split(m.emu.Render(), "\n")
+	n := len(m.rowTracked)
+	unchanged := func(i int) bool {
+		j := i + shift
+		return i < len(afterRows) && j < len(beforeRows) && afterRows[i] == beforeRows[j]
+	}
+	continues := make([]bool, n)
+	widths := make([]int, n)
+	tracked := make([]bool, n)
+	worthKeeping := false
+	for i := range n {
+		j := i + shift
+		if j >= n {
+			break // scrolled in fresh at the bottom: nothing recorded
+		}
+		continues[i] = m.rowContinues[j]
+		widths[i] = m.rowWrittenWidths[j]
+		tracked[i] = m.rowTracked[j] && (i == 0 || unchanged(i-1))
+		// A blank row above tracks trivially (nothing wraps out of
+		// it); a record holding nothing else isn't worth a
+		// before/after render on every future write.
+		if tracked[i] && i > 0 && strings.TrimSpace(afterRows[i-1]) != "" {
+			worthKeeping = true
+		}
+	}
+	if !worthKeeping {
+		m.rowContinues, m.rowWrittenWidths, m.rowTracked = nil, nil, nil
+		return m
+	}
+	m.rowContinues, m.rowWrittenWidths, m.rowTracked = continues, widths, tracked
 	return m
 }
 
@@ -492,22 +609,16 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		// grows by the same amount to compensate. A no-op while following
 		// (scrollOffset == 0 stays 0 — nothing to pin).
 		wasAltScreen := m.emu.IsAltScreen()
-		var beforeLen int
-		if m.scrollOffset > 0 {
-			beforeLen = m.emu.ScrollbackLen()
+		beforeLen := m.emu.ScrollbackLen()
+		// Only worth capturing while there's a tracked record to
+		// preserve — a session that has never been resized (or whose
+		// record has fully aged out) pays nothing extra per write.
+		var beforeRows []string
+		if m.rowTracked != nil && !wasAltScreen {
+			beforeRows = strings.Split(m.emu.Render(), "\n")
 		}
 		m.emu.Write(msg.data)
-		// Any real output can change rows this package previously
-		// tracked as reflow continuations in ways it has no visibility
-		// into (new content, a redraw, a prompt repaint) — the tracked
-		// record can only be trusted for a resize-only sequence with
-		// nothing typed in between, so it must not survive past this
-		// point. The next SetSize call falls back to the heuristic for
-		// this content (identical to today's behavior) and rebuilds a
-		// fresh, trustworthy record from there for any FURTHER resize
-		// in the same drag.
-		m.rowContinues = nil
-		m.rowWrittenWidths = nil
+		m = m.retrackRowsAfterOutput(beforeRows, beforeLen)
 		switch {
 		case wasAltScreen && !m.emu.IsAltScreen():
 			// The alt screen (vim, less, ...) just exited as part of this

@@ -1541,14 +1541,82 @@ func TestSetSizeSequentialResizesDoNotDropAWordBoundarySpace(t *testing.T) {
 	}
 }
 
-// TestSetSizeRowContinuesInvalidatedByRealOutputBetweenResizes proves
-// the safety valve: real output arriving between two resizes must not
-// panic or corrupt worse than the pre-existing single-miss heuristic
-// behavior — the tracked record simply resets to nil (identical to
-// having never reflowed this content before), and the next resize
-// falls back to today's heuristic for it, exactly as before this
-// feature existed.
-func TestSetSizeRowContinuesInvalidatedByRealOutputBetweenResizes(t *testing.T) {
+// TestSetSizeDenseResizeSurvivesShellPromptRedrawAfterEveryStep is the
+// regression test for the continuation-tracking fix never engaging
+// against a real interactive shell: every pty resize delivers SIGWINCH,
+// and zsh (bash/readline likewise) answers each one by redrawing its
+// prompt — "\r\r", a few SGR resets, "\x1b[J", then the prompt text
+// (captured verbatim from a real tmux-driven drag). That redraw arrives
+// as an OutputMsg between EVERY pair of SetSize calls in a real drag,
+// and Update used to throw the whole tracked record away on any output
+// at all — so every step fell back to the rendered-string heuristic and
+// the missed-joins compounded exactly as if the tracking didn't exist
+// (content left fragmented into short rows after a shrink-and-regrow).
+// TestSetSizeSequentialResizesDoNotDropAWordBoundarySpace above couldn't
+// catch this: it chains SetSize calls with no output in between, which
+// a real shell never does.
+//
+// The redraw only rewrites the prompt row, so every row above it must
+// keep its tracked state — and the original lines must come back as
+// the same single rows they started as once the width is restored.
+func TestSetSizeDenseResizeSurvivesShellPromptRedrawAfterEveryStep(t *testing.T) {
+	p := &fakePty{}
+	origPty := newPty
+	newPty = func(width, height int) (Pty, error) { return p, nil }
+	t.Cleanup(func() { newPty = origPty })
+
+	m := New(1).SetSize(118, 35)
+	m, _ = m.Start()
+	t.Cleanup(func() { _ = m.Close() })
+
+	lines := []string{
+		"  from rendered rows rather than raw terminal cells. Content that scrolls",
+		"  off the pane's visible area (from a height shrink or from reflow",
+		"  running out of room) is also never re-wrapped again by a later resize",
+		"  it stays wrapped at whatever width it was at when it scrolled off,",
+	}
+	const prompt = "user@host cody % "
+	const promptRedraw = "\r\r\x1b[0m\x1b[27m\x1b[24m\x1b[J" + prompt
+	text := strings.Join(lines, "\r\n") + "\r\n" + prompt
+	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(text)})
+	m = updated
+
+	widths := []struct{ w, h int }{
+		{110, 34}, {102, 33}, {94, 32}, {86, 31}, {78, 30},
+		{70, 29}, {62, 28}, {54, 27}, {46, 26}, {38, 25},
+		{30, 24}, {28, 23}, {30, 24}, {38, 25}, {46, 26},
+		{54, 27}, {62, 28}, {70, 29}, {78, 30}, {86, 31},
+		{94, 32}, {102, 33}, {110, 34}, {118, 35},
+	}
+	for _, wh := range widths {
+		m = m.SetSize(wh.w, wh.h)
+		updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(promptRedraw)})
+		m = updated
+	}
+
+	rows := strings.Split(m.View(), "\n")
+	for i, want := range lines {
+		if i >= len(rows) || strings.TrimRight(rows[i], " ") != want {
+			t.Fatalf("row %d: got %q, want the original line %q rejoined intact — full view:\n%s", i, rows[i], want, m.View())
+		}
+	}
+	if got := strings.TrimRight(rows[len(lines)], " "); got != strings.TrimRight(prompt, " ") {
+		t.Fatalf("got prompt row %q, want %q — full view:\n%s", got, prompt, m.View())
+	}
+}
+
+// TestUpdateOutputUntracksOnlyTheRowsItChanged pins the per-row
+// invalidation rule: real output must stop the tracked wrap record
+// being trusted for the wrap boundary under any row it actually
+// rewrote — this package has no idea what the shell just did there —
+// but every boundary under a row it left alone keeps its state. That
+// includes the prompt row here staying a known NON-continuation of the
+// full-width row above it while it's typed into: the heuristic alone
+// would false-join the two. (Dropping the WHOLE record on any output, as this
+// used to, meant a real shell's SIGWINCH prompt redraw wiped it between
+// every pair of resizes in a drag — see
+// TestSetSizeDenseResizeSurvivesShellPromptRedrawAfterEveryStep.)
+func TestUpdateOutputUntracksOnlyTheRowsItChanged(t *testing.T) {
 	p := &fakePty{}
 	origPty := newPty
 	newPty = func(width, height int) (Pty, error) { return p, nil }
@@ -1558,27 +1626,112 @@ func TestSetSizeRowContinuesInvalidatedByRealOutputBetweenResizes(t *testing.T) 
 	m, _ = m.Start()
 	t.Cleanup(func() { _ = m.Close() })
 
-	const line = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
+	const text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123\r\n$ "
+	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(text)})
+	m = updated
+
+	m = m.SetSize(10, 10) // rows: ABCDEFGHIJ / KLMNOPQRST / UVWXYZ0123 / "$ "
+	for i, tracked := range m.rowTracked {
+		if !tracked {
+			t.Fatalf("got row %d untracked right after a reflow, want every row tracked", i)
+		}
+	}
+
+	// Typed at the prompt: only row 3 changes.
+	updated, _ = m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte("ls")})
+	m = updated
+	if got, want := m.rowTracked[:5], []bool{true, true, true, true, false}; !slicesEqual(got, want) {
+		t.Fatalf("got rowTracked[:5]=%v after output on row 3, want %v — a row's bit records whether the row ABOVE wrapped into it, so only row 4's (above it: the changed row 3) is lost", got, want)
+	}
+	if got, want := m.rowContinues[:3], []bool{false, true, true}; !slicesEqual(got, want) {
+		t.Fatalf("got rowContinues[:3]=%v, want %v carried through unchanged", got, want)
+	}
+
+	m = m.SetSize(40, 10)
+	rows := strings.Split(m.View(), "\n")
+	if got := strings.TrimRight(rows[0], " "); got != "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123" {
+		t.Fatalf("got row 0 %q after widening, want the wrapped line rejoined intact", got)
+	}
+	if got := strings.TrimRight(rows[1], " "); got != "$ ls" {
+		t.Fatalf("got row 1 %q after widening, want the prompt row %q on its own", got, "$ ls")
+	}
+}
+
+// TestUpdateOutputThatScrollsShiftsTheTrackedRecordWithTheContent:
+// output that scrolls the screen moves every surviving row up, and its
+// tracked state must move with it — matched against the row it came
+// from, not the unrelated row that used to sit at the same index.
+func TestUpdateOutputThatScrollsShiftsTheTrackedRecordWithTheContent(t *testing.T) {
+	p := &fakePty{}
+	origPty := newPty
+	newPty = func(width, height int) (Pty, error) { return p, nil }
+	t.Cleanup(func() { newPty = origPty })
+
+	m := New(1).SetSize(40, 4)
+	m, _ = m.Start()
+	t.Cleanup(func() { _ = m.Close() })
+
+	// "two words " wraps at width 10 with the boundary landing right
+	// after a space — the case only the tracked record gets right.
+	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte("first\r\nsome words and more\r\n$ ")})
+	m = updated
+	m = m.SetSize(10, 4) // rows: first / "some words" / " and more" / "$ "... exact split asserted below
+	before := strings.Split(m.View(), "\n")
+
+	// Two newlines at the bottom row scroll the screen by two.
+	updated, _ = m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte("\r\n\r\n$ ")})
+	m = updated
+	after := strings.Split(m.View(), "\n")
+	if after[0] != before[2] {
+		t.Fatalf("test setup: got row 0 %q after scrolling, want what was row 2 (%q)", after[0], before[2])
+	}
+	if m.rowTracked == nil || !m.rowTracked[0] || !m.rowTracked[1] {
+		t.Fatalf("got rowTracked=%v after a 2-line scroll, want rows 0-1 (formerly rows 2-3) still tracked", m.rowTracked)
+	}
+	if !m.rowContinues[0] {
+		t.Fatalf("got rowContinues[0]=false, want the continuation bit of what was row 2 carried up with it")
+	}
+}
+
+// TestSetSizeHeightOnlyResizeDoesNotRecordFreshWrapsAsCertainNonContinuations
+// covers the pass-through (width unchanged) branch: with no tracked
+// record yet, it used to hand writeReflowedRows a nil record, which
+// stored "not a continuation" for every row AS CERTAIN — so a
+// genuinely wrapped line on screen during a height-only step (dragging
+// the pane's top edge, or a corner-drag step where only the height
+// moved) would refuse to rejoin on the next width change. The
+// heuristic's answer must be what gets recorded instead.
+func TestSetSizeHeightOnlyResizeDoesNotRecordFreshWrapsAsCertainNonContinuations(t *testing.T) {
+	p := &fakePty{}
+	origPty := newPty
+	newPty = func(width, height int) (Pty, error) { return p, nil }
+	t.Cleanup(func() { newPty = origPty })
+
+	m := New(1).SetSize(10, 6)
+	m, _ = m.Start()
+	t.Cleanup(func() { _ = m.Close() })
+
+	const line = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123" // wraps to 3 full rows at width 10
 	updated, _ := m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte(line)})
 	m = updated
 
-	m = m.SetSize(10, 10) // builds a tracked rowContinues record
-	if m.rowContinues == nil {
-		t.Fatalf("got nil rowContinues after a width-changing resize, want a populated record")
+	m = m.SetSize(10, 5) // height only
+	m = m.SetSize(40, 5)
+	if got := strings.TrimRight(strings.Split(m.View(), "\n")[0], " "); got != line {
+		t.Fatalf("got row 0 %q after widening, want the wrapped line rejoined as %q", got, line)
 	}
+}
 
-	updated, _ = m.Update(OutputMsg{id: 1, generation: m.generation, data: []byte("more")})
-	m = updated
-	if m.rowContinues != nil {
-		t.Fatalf("got non-nil rowContinues after real output, want nil — output must invalidate the tracked record")
+func slicesEqual(a, b []bool) bool {
+	if len(a) != len(b) {
+		return false
 	}
-
-	// Must not panic, and must still produce SOME reasonable output —
-	// no crash is the bar here, not perfection.
-	m = m.SetSize(40, 10)
-	if m.View() == "" {
-		t.Fatalf("got empty view after resize following an invalidated record, want non-empty content")
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
 	}
+	return true
 }
 
 // TestSetSizeRowContinuesSurvivesHeightEvictionWithoutPanicking drives

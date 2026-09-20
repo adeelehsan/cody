@@ -169,9 +169,17 @@ func cursorOffset(rows []string, physicalRowCounts []int, cursorRow, cursorCol i
 // physical row before adding its own column). Using <= placed such a
 // cursor one row too high; falling through to decrement offset by w and
 // continue naturally lands it at (nextRow, 0) instead. The fallback
-// after the loop is unchanged: offset landing exactly at the end of the
-// LAST row (no next row to fall through to) still returns
-// (last, width) — the correct "end of content" position.
+// after the loop: offset landing exactly at the end of the LAST row (no
+// next row to fall through to) returns (last, width) — the correct "end
+// of content" position — and whatever offset is left over beyond that
+// is kept as extra columns rather than dropped. A cursor legitimately
+// sits past the end of the rendered content whenever blank cells
+// precede it, and the emulator strips those from the rendered row: the
+// everyday case is a prompt's own trailing space ("$ " renders as "$"
+// with the cursor at column 2). Clamping back to the content's end
+// would slide the cursor left over that space, and the next thing typed
+// lands glued onto the prompt. The caller's cursor-position write
+// clamps to the grid's real width, so this can't overshoot the pane.
 func cursorAfterRewrap(newRows []string, offset int) (row, col int) {
 	for i, r := range newRows {
 		w := ansi.StringWidth(r)
@@ -184,7 +192,7 @@ func cursorAfterRewrap(newRows []string, offset int) (row, col int) {
 		return 0, 0
 	}
 	last := len(newRows) - 1
-	return last, ansi.StringWidth(newRows[last])
+	return last, ansi.StringWidth(newRows[last]) + offset
 }
 
 // reflowRows re-wraps every physical row in rows (at oldWidth) to
